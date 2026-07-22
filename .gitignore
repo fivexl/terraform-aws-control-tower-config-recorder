@@ -17,6 +17,12 @@ override.tf.json
 builds/
 *.zip
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
 # OS files
 .DS_Store
 Thumbs.db
