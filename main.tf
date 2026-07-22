@@ -75,7 +75,7 @@ data "aws_iam_policy_document" "lambda_policy" {
   statement {
     effect    = "Allow"
     actions   = ["sts:AssumeRole"]
-    resources = ["*"]
+    resources = ["arn:${data.aws_partition.current.partition}:iam::*:role/AWSControlTowerExecution"]
   }
 }
 
