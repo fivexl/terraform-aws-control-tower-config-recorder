@@ -87,12 +87,12 @@ resource "aws_lambda_function" "config_recorder_override" {
 
   environment {
     variables = {
-      ACCOUNT_SELECTION_MODE                       = var.account_selection_mode
-      EXCLUDED_ACCOUNTS                            = local.excluded_accounts_str
-      INCLUDED_ACCOUNTS                            = local.included_accounts_str
-      LOG_LEVEL                                    = "INFO"
-      CONFIG_RECORDER_STRATEGY                     = var.config_recorder_strategy
-      CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST = var.config_recorder_daily_resource_types
+      ACCOUNT_SELECTION_MODE                              = var.account_selection_mode
+      EXCLUDED_ACCOUNTS                                   = local.excluded_accounts_str
+      INCLUDED_ACCOUNTS                                   = local.included_accounts_str
+      LOG_LEVEL                                           = "INFO"
+      CONFIG_RECORDER_STRATEGY                            = var.config_recorder_strategy
+      CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST        = var.config_recorder_daily_resource_types
       CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST = var.config_recorder_daily_global_resource_types
       CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST     = var.config_recorder_excluded_resource_types
       CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST     = var.config_recorder_included_resource_types

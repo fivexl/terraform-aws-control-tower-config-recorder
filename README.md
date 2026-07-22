@@ -36,11 +36,12 @@ terraform apply
 
 ### Using as a Module
 
-To use this as a Terraform module from another repository:
+To use this as a Terraform module from the registry:
 
 ```hcl
 module "config_recorder_override" {
-  source = "git::https://github.com/fivexl/terraform-aws-control-tower-config-recorder.git?ref=main"
+  source  = "fivexl/control-tower-config-recorder/aws"
+  version = "~> 1.0"
 
   aws_region             = "us-east-1"
   account_selection_mode = "EXCLUSION"
@@ -132,6 +133,9 @@ These have special roles in Control Tower governance and should maintain default
 ├── outputs.tf                         # Outputs
 ├── versions.tf                        # Provider version constraints
 ├── ct_configrecorder_override.py      # Lambda function source code
+├── examples/
+│   ├── basic/                         # Basic exclusion mode example
+│   └── inclusion-mode/                # Inclusion mode example
 ├── .gitignore                         # Terraform and OS exclusions
 ├── CHANGELOG.md                       # Version history
 └── README.md                          # This file
