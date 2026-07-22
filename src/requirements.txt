@@ -1,0 +1,2 @@
+# No external dependencies required.
+# boto3 is provided by the AWS Lambda runtime.
