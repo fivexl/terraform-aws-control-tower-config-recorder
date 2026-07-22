@@ -72,3 +72,9 @@ variable "config_recorder_default_recording_frequency" {
     error_message = "Must be CONTINUOUS or DAILY."
   }
 }
+
+variable "cloudwatch_logs_retention_in_days" {
+  description = "Number of days to retain Lambda CloudWatch log events"
+  type        = number
+  default     = 14
+}

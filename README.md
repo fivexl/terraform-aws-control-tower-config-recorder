@@ -24,7 +24,7 @@ Originally based on the AWS blog post: https://aws.amazon.com/blogs/mt/customize
 ## Architecture
 
 The solution deploys:
-- A single **Lambda function** that assumes the `AWSControlTowerExecution` role into each target account and updates the Config Recorder
+- A **Lambda function** (via [terraform-aws-modules/lambda/aws](https://registry.terraform.io/modules/terraform-aws-modules/lambda/aws)) that assumes the `AWSControlTowerExecution` role into each target account and updates the Config Recorder
 - An **EventBridge rule** that triggers the Lambda on Control Tower lifecycle events (CreateManagedAccount, UpdateManagedAccount, UpdateLandingZone, ResetLandingZone)
 - A **terraform_data resource** that invokes the Lambda on every `terraform apply` when code or configuration changes
 
@@ -41,30 +41,22 @@ Due to the sequential processing and 15-minute Lambda timeout, this module suppo
 
 ## Usage
 
-```bash
-terraform init
-terraform plan
-terraform apply
-```
-
 ### Using as a Module
-
-To use this as a Terraform module from the registry:
 
 ```hcl
 module "config_recorder_override" {
   source  = "fivexl/control-tower-config-recorder/aws"
-  version = "~> 1.0"
+  version = "~> 2.0"
 
   aws_region             = "us-east-1"
   account_selection_mode = "EXCLUSION"
   excluded_accounts      = ["111111111111", "222222222222", "333333333333"]
 
-  config_recorder_strategy                     = "EXCLUSION"
-  config_recorder_excluded_resource_types      = "AWS::HealthLake::FHIRDatastore,AWS::Pinpoint::Segment,AWS::Pinpoint::ApplicationSettings"
-  config_recorder_default_recording_frequency  = "CONTINUOUS"
-  config_recorder_daily_resource_types         = "AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"
-  config_recorder_daily_global_resource_types  = "AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"
+  config_recorder_strategy                    = "EXCLUSION"
+  config_recorder_excluded_resource_types     = "AWS::HealthLake::FHIRDatastore,AWS::Pinpoint::Segment,AWS::Pinpoint::ApplicationSettings"
+  config_recorder_default_recording_frequency = "CONTINUOUS"
+  config_recorder_daily_resource_types        = "AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"
+  config_recorder_daily_global_resource_types = "AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"
 }
 
 output "lambda_arn" {
@@ -118,6 +110,12 @@ config_recorder_daily_global_resource_types  = "AWS::IAM::Policy,AWS::IAM::User,
 | `config_recorder_daily_resource_types` | Resource types recorded daily | `AWS::AutoScaling::AutoScalingGroup,...` |
 | `config_recorder_daily_global_resource_types` | Global resource types recorded daily in home region | `AWS::IAM::Policy,AWS::IAM::User,...` |
 
+### Lambda
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `cloudwatch_logs_retention_in_days` | Number of days to retain Lambda CloudWatch log events | `14` |
+
 ## Account Selection Modes
 
 ### EXCLUSION Mode (Default)
@@ -141,11 +139,12 @@ These have special roles in Control Tower governance and should maintain default
 
 ```
 .
-├── main.tf                            # Resources (Lambda, IAM, EventBridge)
+├── main.tf                            # Resources (Lambda module, EventBridge, invoke)
 ├── variables.tf                       # Input variables
 ├── outputs.tf                         # Outputs
 ├── versions.tf                        # Provider version constraints
-├── ct_configrecorder_override.py      # Lambda function source code
+├── src/
+│   └── ct_configrecorder_override.py  # Lambda function source code
 ├── examples/
 │   ├── basic/                         # Basic exclusion mode example
 │   └── inclusion-mode/                # Inclusion mode example

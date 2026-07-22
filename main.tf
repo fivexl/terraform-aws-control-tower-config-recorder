@@ -11,29 +11,51 @@ locals {
 }
 
 # -----------------------------------------------------------------------------
-# Lambda deployment package
+# Lambda Function (using terraform-aws-modules/lambda/aws)
 # -----------------------------------------------------------------------------
 
-data "archive_file" "lambda_zip" {
-  type        = "zip"
-  source_file = "${path.module}/ct_configrecorder_override.py"
-  output_path = "${path.module}/ct_configrecorder_override.zip"
-}
+module "lambda" {
+  source  = "terraform-aws-modules/lambda/aws"
+  version = "8.2.1"
 
-# -----------------------------------------------------------------------------
-# IAM Role for the Lambda function
-# -----------------------------------------------------------------------------
+  function_name = "ct-config-recorder-override"
+  description   = "Override AWS Config Recorder settings in Control Tower managed accounts"
+  handler       = "ct_configrecorder_override.lambda_handler"
+  runtime       = "python3.12"
+  architectures = ["x86_64"]
+  memory_size   = 256
+  timeout       = 900
+  publish       = true
 
-data "aws_iam_policy_document" "lambda_assume_role" {
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRole"]
+  source_path = "${path.module}/src"
 
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
+  reserved_concurrent_executions = 1
+
+  environment_variables = {
+    ACCOUNT_SELECTION_MODE                              = var.account_selection_mode
+    EXCLUDED_ACCOUNTS                                   = local.excluded_accounts_str
+    INCLUDED_ACCOUNTS                                   = local.included_accounts_str
+    LOG_LEVEL                                           = "INFO"
+    CONFIG_RECORDER_STRATEGY                            = var.config_recorder_strategy
+    CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST        = var.config_recorder_daily_resource_types
+    CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST = var.config_recorder_daily_global_resource_types
+    CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST     = var.config_recorder_excluded_resource_types
+    CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST     = var.config_recorder_included_resource_types
+    CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY         = var.config_recorder_default_recording_frequency
+    CONTROL_TOWER_HOME_REGION                           = var.aws_region
+  }
+
+  attach_policy_json = true
+  policy_json        = data.aws_iam_policy_document.lambda_policy.json
+
+  allowed_triggers = {
+    ControlTowerEvents = {
+      principal  = "events.amazonaws.com"
+      source_arn = aws_cloudwatch_event_rule.control_tower.arn
     }
   }
+
+  cloudwatch_logs_retention_in_days = var.cloudwatch_logs_retention_in_days
 }
 
 data "aws_iam_policy_document" "lambda_policy" {
@@ -49,56 +71,6 @@ data "aws_iam_policy_document" "lambda_policy" {
     effect    = "Allow"
     actions   = ["sts:AssumeRole"]
     resources = ["*"]
-  }
-}
-
-resource "aws_iam_role" "lambda" {
-  name               = "ct-config-recorder-override-lambda"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
-}
-
-resource "aws_iam_role_policy" "lambda" {
-  name   = "ct-config-recorder-override"
-  role   = aws_iam_role.lambda.id
-  policy = data.aws_iam_policy_document.lambda_policy.json
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
-  role       = aws_iam_role.lambda.name
-  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-# -----------------------------------------------------------------------------
-# Lambda Function
-# -----------------------------------------------------------------------------
-
-resource "aws_lambda_function" "config_recorder_override" {
-  function_name    = "ct-config-recorder-override"
-  filename         = data.archive_file.lambda_zip.output_path
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
-  handler          = "ct_configrecorder_override.lambda_handler"
-  role             = aws_iam_role.lambda.arn
-  runtime          = "python3.12"
-  memory_size      = 256
-  timeout          = 900
-  architectures    = ["x86_64"]
-
-  reserved_concurrent_executions = 1
-
-  environment {
-    variables = {
-      ACCOUNT_SELECTION_MODE                              = var.account_selection_mode
-      EXCLUDED_ACCOUNTS                                   = local.excluded_accounts_str
-      INCLUDED_ACCOUNTS                                   = local.included_accounts_str
-      LOG_LEVEL                                           = "INFO"
-      CONFIG_RECORDER_STRATEGY                            = var.config_recorder_strategy
-      CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST        = var.config_recorder_daily_resource_types
-      CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST = var.config_recorder_daily_global_resource_types
-      CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST     = var.config_recorder_excluded_resource_types
-      CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST     = var.config_recorder_included_resource_types
-      CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY         = var.config_recorder_default_recording_frequency
-      CONTROL_TOWER_HOME_REGION                           = var.aws_region
-    }
   }
 }
 
@@ -121,15 +93,7 @@ resource "aws_cloudwatch_event_rule" "control_tower" {
 
 resource "aws_cloudwatch_event_target" "lambda" {
   rule = aws_cloudwatch_event_rule.control_tower.name
-  arn  = aws_lambda_function.config_recorder_override.arn
-}
-
-resource "aws_lambda_permission" "eventbridge" {
-  statement_id  = "AllowEventBridgeInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.config_recorder_override.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.control_tower.arn
+  arn  = module.lambda.lambda_function_arn
 }
 
 # -----------------------------------------------------------------------------
@@ -140,8 +104,8 @@ resource "aws_lambda_permission" "eventbridge" {
 resource "terraform_data" "invoke_lambda" {
   # Re-trigger whenever the Lambda code or environment changes
   triggers_replace = [
-    aws_lambda_function.config_recorder_override.source_code_hash,
-    aws_lambda_function.config_recorder_override.environment,
+    module.lambda.lambda_function_source_code_hash,
+    module.lambda.lambda_function_version,
   ]
 
   provisioner "local-exec" {
@@ -151,7 +115,7 @@ resource "terraform_data" "invoke_lambda" {
       ATTEMPT=0
       while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
         RESULT=$(aws lambda invoke \
-          --function-name ${aws_lambda_function.config_recorder_override.function_name} \
+          --function-name ${module.lambda.lambda_function_name} \
           --region ${var.aws_region} \
           --invocation-type Event \
           --payload '${jsonencode({ action = "apply" })}' \

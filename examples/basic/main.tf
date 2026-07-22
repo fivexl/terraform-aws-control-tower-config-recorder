@@ -3,7 +3,8 @@ provider "aws" {
 }
 
 module "config_recorder_override" {
-  source = "fivexl/control-tower-config-recorder/aws"
+  source  = "fivexl/control-tower-config-recorder/aws"
+  version = "~> 2.0"
 
   aws_region             = "us-east-1"
   account_selection_mode = "EXCLUSION"
@@ -18,6 +19,10 @@ module "config_recorder_override" {
 
 output "lambda_arn" {
   value = module.config_recorder_override.lambda_function_arn
+}
+
+output "lambda_role_arn" {
+  value = module.config_recorder_override.lambda_role_arn
 }
 
 output "eventbridge_rule_arn" {

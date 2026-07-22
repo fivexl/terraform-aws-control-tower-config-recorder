@@ -351,25 +351,26 @@ def lambda_handler(event, context):
             event_name = event['detail']['eventName']
             logging.info(f'Control Tower Event Name: {event_name}')
 
-        if event_source == 'aws.controltower' and event_name == 'UpdateManagedAccount':
-            account = event['detail']['serviceEventDetails']['updateManagedAccountStatus']['account']['accountId']
-            logging.info(f'Overriding config recorder for SINGLE account: {account}')
-            process_accounts(selection_mode, excluded_accounts, included_accounts, account, 'controltower')
+        match (event_source, event_name):
+            case ('aws.controltower', 'UpdateManagedAccount'):
+                account = event['detail']['serviceEventDetails']['updateManagedAccountStatus']['account']['accountId']
+                logging.info(f'Overriding config recorder for SINGLE account: {account}')
+                process_accounts(selection_mode, excluded_accounts, included_accounts, account, 'controltower')
 
-        elif event_source == 'aws.controltower' and event_name == 'CreateManagedAccount':
-            account = event['detail']['serviceEventDetails']['createManagedAccountStatus']['account']['accountId']
-            logging.info(f'Overriding config recorder for SINGLE account: {account}')
-            process_accounts(selection_mode, excluded_accounts, included_accounts, account, 'controltower')
+            case ('aws.controltower', 'CreateManagedAccount'):
+                account = event['detail']['serviceEventDetails']['createManagedAccountStatus']['account']['accountId']
+                logging.info(f'Overriding config recorder for SINGLE account: {account}')
+                process_accounts(selection_mode, excluded_accounts, included_accounts, account, 'controltower')
 
-        elif event_source == 'aws.controltower' and event_name in ('UpdateLandingZone', 'ResetLandingZone'):
-            logging.info(f'Overriding config recorder for ALL accounts due to {event_name} event')
-            process_accounts(selection_mode, excluded_accounts, included_accounts, '', 'controltower')
+            case ('aws.controltower', 'UpdateLandingZone' | 'ResetLandingZone'):
+                logging.info(f'Overriding config recorder for ALL accounts due to {event_name} event')
+                process_accounts(selection_mode, excluded_accounts, included_accounts, '', 'controltower')
 
-        else:
-            # Direct invocation (e.g., from Terraform local-exec or manual trigger)
-            action = event.get('action', 'apply')
-            logging.info(f'Direct invocation with action: {action}')
-            process_accounts(selection_mode, excluded_accounts, included_accounts, '', action)
+            case _:
+                # Direct invocation (e.g., from Terraform local-exec or manual trigger)
+                action = event.get('action', 'apply')
+                logging.info(f'Direct invocation with action: {action}')
+                process_accounts(selection_mode, excluded_accounts, included_accounts, '', action)
 
         logging.info('Execution Successful')
         return {'statusCode': 200}

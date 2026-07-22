@@ -1,11 +1,16 @@
 output "lambda_function_name" {
   description = "Name of the Config Recorder override Lambda function"
-  value       = aws_lambda_function.config_recorder_override.function_name
+  value       = module.lambda.lambda_function_name
 }
 
 output "lambda_function_arn" {
   description = "ARN of the Config Recorder override Lambda function"
-  value       = aws_lambda_function.config_recorder_override.arn
+  value       = module.lambda.lambda_function_arn
+}
+
+output "lambda_role_arn" {
+  description = "ARN of the IAM role created for the Lambda function"
+  value       = module.lambda.lambda_role_arn
 }
 
 output "eventbridge_rule_arn" {

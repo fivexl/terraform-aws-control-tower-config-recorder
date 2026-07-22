@@ -3,7 +3,8 @@ provider "aws" {
 }
 
 module "config_recorder_override" {
-  source = "fivexl/control-tower-config-recorder/aws"
+  source  = "fivexl/control-tower-config-recorder/aws"
+  version = "~> 2.0"
 
   aws_region             = "us-east-1"
   account_selection_mode = "INCLUSION"
@@ -14,6 +15,8 @@ module "config_recorder_override" {
   config_recorder_default_recording_frequency = "DAILY"
   config_recorder_daily_resource_types        = "AWS::IAM::Role,AWS::IAM::Policy"
   config_recorder_daily_global_resource_types = "AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"
+
+  cloudwatch_logs_retention_in_days = 30
 }
 
 output "lambda_arn" {
