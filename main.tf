@@ -17,9 +17,9 @@ module "lambda" {
   function_name = "ct-config-recorder-override"
   description   = "Override AWS Config Recorder settings in Control Tower managed accounts"
   handler       = "ct_configrecorder_override.lambda_handler"
-  runtime       = "python3.12"
+  runtime       = "python3.14"
   architectures = ["x86_64"]
-  memory_size   = 256
+  memory_size   = 1024
   timeout       = 900
   publish       = true
 
