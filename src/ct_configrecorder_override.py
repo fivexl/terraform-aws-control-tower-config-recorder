@@ -169,7 +169,7 @@ def update_config_recorder(account_id, aws_region, event_type):
                 f'Configuration Recorder reset to default. Response: {json.dumps(response, default=str)}')
         else:
             if CONFIG_RECORDER_STRATEGY == 'EXCLUSION':
-                logging.info(f'Using EXCLUSION strategy')
+                logging.info('Using EXCLUSION strategy')
                 logging.info(f'Exclusion resource list: {CONFIG_RECORDER_EXCLUSION_RESOURCE_LIST}')
                 logging.info(f'Daily override resource list: {CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST}')
 
@@ -204,7 +204,7 @@ def update_config_recorder(account_id, aws_region, event_type):
                     config_recorder['recordingGroup']['allSupported'] = True
                     config_recorder['recordingGroup']['includeGlobalResourceTypes'] = True
             else:
-                logging.info(f'Using INCLUSION strategy')
+                logging.info('Using INCLUSION strategy')
                 for resource_type in CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST:
                     if resource_type not in CONFIG_RECORDER_INCLUSION_RESOURCE_LIST:
                         CONFIG_RECORDER_INCLUSION_RESOURCE_LIST.append(resource_type)
