@@ -23,7 +23,16 @@ module "lambda" {
   timeout       = 900
   publish       = true
 
-  source_path = "${path.module}/src"
+  source_path = [
+    {
+      path = "${path.module}/src"
+      patterns = [
+        "!tests/.*",
+        "!requirements\\.txt",
+        "!__pycache__/.*",
+      ]
+    }
+  ]
 
   reserved_concurrent_executions = 1
 

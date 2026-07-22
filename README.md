@@ -83,38 +83,64 @@ config_recorder_daily_resource_types         = "AWS::AutoScaling::AutoScalingGro
 config_recorder_daily_global_resource_types  = "AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"
 ```
 
-## Variables
+## Terraform specs
 
-### Account Selection
+<!-- BEGIN_TF_DOCS -->
+## Requirements
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `aws_region` | AWS region to deploy in | `us-east-1` |
-| `account_selection_mode` | `EXCLUSION` or `INCLUSION` | `EXCLUSION` |
-| `excluded_accounts` | List of account IDs to skip (EXCLUSION mode) | `["111111111111", "222222222222", "333333333333"]` |
-| `included_accounts` | List of account IDs to process (INCLUSION mode) | `[]` |
+| Name | Version |
+| ---- | ------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.5.0 |
+| <a name="requirement_aws"></a> [aws](#requirement\_aws) | >= 5.0 |
 
-### Recording Strategy
+## Providers
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `config_recorder_strategy` | `EXCLUSION` or `INCLUSION` for resource types | `EXCLUSION` |
-| `config_recorder_excluded_resource_types` | Comma-separated resource types to exclude | `AWS::HealthLake::FHIRDatastore,...` |
-| `config_recorder_included_resource_types` | Comma-separated resource types to include | `AWS::S3::Bucket,AWS::CloudTrail::Trail` |
+| Name | Version |
+| ---- | ------- |
+| <a name="provider_aws"></a> [aws](#provider\_aws) | 6.55.0 |
+| <a name="provider_terraform"></a> [terraform](#provider\_terraform) | n/a |
 
-### Recording Frequency
+## Modules
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `config_recorder_default_recording_frequency` | `CONTINUOUS` or `DAILY` | `CONTINUOUS` |
-| `config_recorder_daily_resource_types` | Resource types recorded daily | `AWS::AutoScaling::AutoScalingGroup,...` |
-| `config_recorder_daily_global_resource_types` | Global resource types recorded daily in home region | `AWS::IAM::Policy,AWS::IAM::User,...` |
+| Name | Source | Version |
+| ---- | ------ | ------- |
+| <a name="module_lambda"></a> [lambda](#module\_lambda) | terraform-aws-modules/lambda/aws | 8.2.1 |
 
-### Lambda
+## Resources
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `cloudwatch_logs_retention_in_days` | Number of days to retain Lambda CloudWatch log events | `14` |
+| Name | Type |
+| ---- | ---- |
+| [aws_cloudwatch_event_rule.control_tower](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_rule) | resource |
+| [aws_cloudwatch_event_target.lambda](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_target) | resource |
+| [terraform_data.invoke_lambda](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
+| [aws_iam_policy_document.lambda_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
+| [aws_partition.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/partition) | data source |
+
+## Inputs
+
+| Name | Description | Type | Default | Required |
+| ---- | ----------- | ---- | ------- | :------: |
+| <a name="input_account_selection_mode"></a> [account\_selection\_mode](#input\_account\_selection\_mode) | Account selection mode - EXCLUSION (processes all accounts except those in excluded\_accounts) or INCLUSION (processes only accounts in included\_accounts) | `string` | `"EXCLUSION"` | no |
+| <a name="input_aws_region"></a> [aws\_region](#input\_aws\_region) | AWS region to deploy resources in | `string` | `"us-east-1"` | no |
+| <a name="input_cloudwatch_logs_retention_in_days"></a> [cloudwatch\_logs\_retention\_in\_days](#input\_cloudwatch\_logs\_retention\_in\_days) | Number of days to retain Lambda CloudWatch log events | `number` | `14` | no |
+| <a name="input_config_recorder_daily_global_resource_types"></a> [config\_recorder\_daily\_global\_resource\_types](#input\_config\_recorder\_daily\_global\_resource\_types) | List of global resource types to record daily in the Control Tower home region | `string` | `"AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"` | no |
+| <a name="input_config_recorder_daily_resource_types"></a> [config\_recorder\_daily\_resource\_types](#input\_config\_recorder\_daily\_resource\_types) | List of resource types to record at daily cadence | `string` | `"AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"` | no |
+| <a name="input_config_recorder_default_recording_frequency"></a> [config\_recorder\_default\_recording\_frequency](#input\_config\_recorder\_default\_recording\_frequency) | Default frequency of recording configuration changes | `string` | `"CONTINUOUS"` | no |
+| <a name="input_config_recorder_excluded_resource_types"></a> [config\_recorder\_excluded\_resource\_types](#input\_config\_recorder\_excluded\_resource\_types) | List of resource types to exclude from Config Recorder (used with EXCLUSION strategy) | `string` | `"AWS::HealthLake::FHIRDatastore,AWS::Pinpoint::Segment,AWS::Pinpoint::ApplicationSettings"` | no |
+| <a name="input_config_recorder_included_resource_types"></a> [config\_recorder\_included\_resource\_types](#input\_config\_recorder\_included\_resource\_types) | List of resource types to include in Config Recorder (used with INCLUSION strategy) | `string` | `"AWS::S3::Bucket,AWS::CloudTrail::Trail"` | no |
+| <a name="input_config_recorder_strategy"></a> [config\_recorder\_strategy](#input\_config\_recorder\_strategy) | Config Recorder strategy - EXCLUSION or INCLUSION | `string` | `"EXCLUSION"` | no |
+| <a name="input_excluded_accounts"></a> [excluded\_accounts](#input\_excluded\_accounts) | List of AWS account IDs to exclude. Should contain Management, Log Archive, and Audit accounts at minimum. Only used when account\_selection\_mode is EXCLUSION. | `list(string)` | <pre>[<br/>  "111111111111",<br/>  "222222222222",<br/>  "333333333333"<br/>]</pre> | no |
+| <a name="input_included_accounts"></a> [included\_accounts](#input\_included\_accounts) | List of AWS account IDs to include. Only used when account\_selection\_mode is INCLUSION. | `list(string)` | `[]` | no |
+
+## Outputs
+
+| Name | Description |
+| ---- | ----------- |
+| <a name="output_eventbridge_rule_arn"></a> [eventbridge\_rule\_arn](#output\_eventbridge\_rule\_arn) | ARN of the EventBridge rule that triggers the Lambda |
+| <a name="output_lambda_function_arn"></a> [lambda\_function\_arn](#output\_lambda\_function\_arn) | ARN of the Config Recorder override Lambda function |
+| <a name="output_lambda_function_name"></a> [lambda\_function\_name](#output\_lambda\_function\_name) | Name of the Config Recorder override Lambda function |
+| <a name="output_lambda_role_arn"></a> [lambda\_role\_arn](#output\_lambda\_role\_arn) | ARN of the IAM role created for the Lambda function |
+<!-- END_TF_DOCS -->
 
 ## Account Selection Modes
 
