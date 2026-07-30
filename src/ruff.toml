@@ -1,0 +1,36 @@
+target-version = "py314"
+line-length = 110
+
+[lint]
+# Rules are selected explicitly rather than relying on ruff's defaults. The CI
+# workflow installs the latest ruff, so an unpinned default set means a new ruff
+# release can fail the build on code that has not changed.
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes
+  "I",    # import sorting
+  "UP",   # pyupgrade
+  "B",    # flake8-bugbear
+  "BLE",  # blind except
+  "LOG",  # logging correctness, including calls on the root logger
+  "G",    # logging format
+  "TRY",  # exception anti-patterns
+  "SIM",  # simplifications
+  "RET",  # return statement consistency
+  "C4",   # comprehensions
+]
+
+ignore = [
+  # This module logs with f-strings throughout. The messages are short and the
+  # arguments are already-materialised strings, so deferred % formatting buys
+  # nothing here and reads worse.
+  "G004",
+  # Long, explanatory messages passed straight to raise are intentional: they are
+  # what surfaces in CloudWatch when a run fails.
+  "TRY003",
+]
+
+[lint.per-file-ignores]
+# Tests reach into module internals and assert on private cache state.
+"tests/*" = ["SLF001"]

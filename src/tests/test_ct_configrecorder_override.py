@@ -1,0 +1,282 @@
+"""Tests for ct_configrecorder_override Lambda function."""
+
+import logging
+
+import pytest
+
+import ct_configrecorder_override as mod
+from ct_configrecorder_override import (
+    ConfigRecorderUpdateError,
+    build_recorder_config,
+    build_recorder_payload,
+    get_account_session,
+    get_caller_identity,
+    parse_account_list,
+    should_process_account,
+    summarise_run,
+)
+
+# --- should_process_account ---------------------------------------------------
+
+def test_exclusion_mode_excludes_listed_account():
+    assert should_process_account('111111111111', 'EXCLUSION', ['111111111111'], []) is False
+
+
+def test_exclusion_mode_includes_unlisted_account():
+    assert should_process_account('999999999999', 'EXCLUSION', ['111111111111'], []) is True
+
+
+def test_inclusion_mode_includes_listed_account():
+    assert should_process_account('111111111111', 'INCLUSION', [], ['111111111111']) is True
+
+
+def test_inclusion_mode_excludes_unlisted_account():
+    assert should_process_account('999999999999', 'INCLUSION', [], ['111111111111']) is False
+
+
+# --- parse_account_list ------------------------------------------------------
+
+def test_parse_account_list_reads_json_array():
+    assert parse_account_list('["111111111111", "222222222222"]', 'test') == [
+        '111111111111', '222222222222']
+
+
+def test_parse_account_list_handles_empty_array():
+    assert parse_account_list('[]', 'test') == []
+
+
+def test_parse_account_list_returns_empty_on_invalid_json():
+    assert parse_account_list('not-json', 'test') == []
+
+
+def test_parse_account_list_rejects_non_list_json():
+    """A bare scalar would otherwise fail an `in` test far from the real cause."""
+    assert parse_account_list('5', 'test') == []
+    assert parse_account_list('{"a": 1}', 'test') == []
+
+
+def test_parse_account_list_coerces_items_to_strings():
+    """StackSet output is always strings, so comparisons must be string-to-string."""
+    assert parse_account_list('[111111111111]', 'test') == ['111111111111']
+
+
+# --- caller identity and session caching -------------------------------------
+
+def test_caller_identity_is_resolved_once_per_container(fake_sts):
+    first = get_caller_identity(fake_sts)
+    second = get_caller_identity(fake_sts)
+
+    assert first == {'account': '123456789012', 'partition': 'aws'}
+    assert second == first
+    assert fake_sts.get_caller_identity_calls == 1
+
+
+def test_session_is_assumed_once_per_account(fake_sts):
+    cache = {}
+
+    # Same account across three regions must reuse one set of credentials.
+    first = get_account_session(fake_sts, '999999999999', 'aws', cache)
+    for _ in range(2):
+        assert get_account_session(fake_sts, '999999999999', 'aws', cache) is first
+
+    assert fake_sts.assume_role_calls == 1
+
+
+def test_session_cache_separates_accounts(fake_sts):
+    cache = {}
+
+    a = get_account_session(fake_sts, '111111111111', 'aws', cache)
+    b = get_account_session(fake_sts, '222222222222', 'aws', cache)
+
+    assert a is not b
+    assert fake_sts.assume_role_calls == 2
+
+
+# --- credential safety in logs -----------------------------------------------
+
+def test_sdk_loggers_never_reach_debug(monkeypatch, restore_log_levels):
+    """
+    botocore logs raw HTTP response bodies at DEBUG, and the AssumeRole response
+    body contains SecretAccessKey and SessionToken. Even with LOG_LEVEL=DEBUG the
+    SDK loggers must stay above DEBUG so credentials never reach CloudWatch.
+    """
+    monkeypatch.setenv('LOG_LEVEL', 'DEBUG')
+    mod.configure_logging()
+
+    assert logging.getLogger().isEnabledFor(logging.DEBUG) is True
+
+    for name in ('botocore', 'botocore.parsers', 'boto3', 'urllib3'):
+        assert logging.getLogger(name).isEnabledFor(logging.DEBUG) is False, (
+            f'{name} would log credential material at DEBUG')
+
+
+def test_module_logger_follows_log_level(monkeypatch, restore_log_levels):
+    """
+    The module logs through its own logger, which carries no explicit level and
+    so must inherit whatever LOG_LEVEL sets on the root logger.
+    """
+    monkeypatch.setenv('LOG_LEVEL', 'DEBUG')
+    mod.configure_logging()
+    assert mod.logger.isEnabledFor(logging.DEBUG) is True
+
+    monkeypatch.setenv('LOG_LEVEL', 'WARNING')
+    mod.configure_logging()
+    assert mod.logger.isEnabledFor(logging.DEBUG) is False
+    assert mod.logger.isEnabledFor(logging.WARNING) is True
+
+
+def test_sdk_loggers_still_report_warnings(monkeypatch, restore_log_levels):
+    monkeypatch.setenv('LOG_LEVEL', 'DEBUG')
+    mod.configure_logging()
+
+    for name in mod.SDK_LOGGERS:
+        logger = logging.getLogger(name)
+        assert logger.isEnabledFor(logging.WARNING) is True
+        # Propagation must stay on so warnings reach the Lambda root handler.
+        assert logger.propagate is True
+
+
+def test_assume_role_response_is_not_logged(fake_sts, caplog):
+    """The credentials returned by AssumeRole must not appear in any log record."""
+    with caplog.at_level(logging.DEBUG):
+        get_account_session(fake_sts, '999999999999', 'aws', {})
+
+    emitted = ' '.join(record.getMessage() for record in caplog.records)
+    assert 'secret' not in emitted
+    assert 'token' not in emitted
+    assert 'AKIA' not in emitted
+    # The account ID is still expected, so the log remains useful.
+    assert '999999999999' in emitted
+
+
+# --- summarise_run -----------------------------------------------------------
+
+def test_summarise_run_returns_summary_on_full_success():
+    result = summarise_run({'updated': 5, 'failed': 0, 'failures': [], 'fatal': None})
+    assert result == {'statusCode': 200, 'updated': 5, 'failed': 0}
+
+
+def test_summarise_run_raises_on_partial_failure():
+    """
+    Partial failures must raise. The invocation is asynchronous, so returning a
+    500 body would be discarded and the run would look successful.
+    """
+    with pytest.raises(ConfigRecorderUpdateError) as exc:
+        summarise_run({
+            'updated': 3,
+            'failed': 1,
+            'failures': ['111111111111/eu-west-1: boom'],
+            'fatal': None,
+        })
+
+    assert '1 of 4' in str(exc.value)
+    assert '111111111111/eu-west-1' in str(exc.value)
+
+
+def test_summarise_run_raises_on_fatal_error():
+    with pytest.raises(ConfigRecorderUpdateError, match='StackSet missing'):
+        summarise_run({
+            'updated': 0,
+            'failed': 0,
+            'failures': [],
+            'fatal': 'ValidationError: StackSet missing',
+        })
+
+
+def test_summarise_run_succeeds_when_nothing_matched():
+    """Zero targeted accounts is a valid outcome, not a failure."""
+    assert summarise_run(
+        {'updated': 0, 'failed': 0, 'failures': [], 'fatal': None})['statusCode'] == 200
+
+
+# --- build_recorder_config ---------------------------------------------------
+
+def test_exclusion_strategy_drops_daily_types_that_are_excluded(recorder_env):
+    recorder_env(
+        CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::EC2::Volume,AWS::S3::Bucket',
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
+    )
+    assert build_recorder_config('eu-west-1')['daily'] == ['AWS::S3::Bucket']
+
+
+def test_global_daily_types_added_only_in_home_region(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST='AWS::IAM::Role')
+
+    assert build_recorder_config('us-east-1')['daily'] == ['AWS::IAM::Role']
+    assert build_recorder_config('eu-west-1')['daily'] == []
+
+
+def test_inclusion_strategy_adds_daily_types_to_inclusion_list(recorder_env):
+    recorder_env(
+        CONFIG_RECORDER_STRATEGY='INCLUSION',
+        CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST='AWS::S3::Bucket',
+        CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::EC2::Volume',
+    )
+    assert build_recorder_config('eu-west-1')['inclusion'] == [
+        'AWS::S3::Bucket', 'AWS::EC2::Volume']
+
+
+# --- build_recorder_payload --------------------------------------------------
+
+def test_delete_event_resets_to_all_supported(recorder_env):
+    recorder_env()
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config('us-east-1'), 'Delete')
+
+    assert payload['recordingGroup']['allSupported'] is True
+    assert payload['recordingGroup']['includeGlobalResourceTypes'] is True
+    assert 'recordingMode' not in payload
+
+
+def test_exclusion_payload_uses_exclusion_strategy(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+
+    group = payload['recordingGroup']
+    assert group['allSupported'] is False
+    assert group['recordingStrategy']['useOnly'] == 'EXCLUSION_BY_RESOURCE_TYPES'
+    assert group['exclusionByResourceTypes']['resourceTypes'] == ['AWS::EC2::Volume']
+
+
+def test_empty_exclusion_list_records_everything(recorder_env):
+    recorder_env()
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+
+    assert payload['recordingGroup']['allSupported'] is True
+    assert 'exclusionByResourceTypes' not in payload['recordingGroup']
+
+
+def test_inclusion_payload_uses_inclusion_strategy(recorder_env):
+    recorder_env(
+        CONFIG_RECORDER_STRATEGY='INCLUSION',
+        CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST='AWS::S3::Bucket',
+    )
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+
+    group = payload['recordingGroup']
+    assert group['resourceTypes'] == ['AWS::S3::Bucket']
+    assert group['recordingStrategy']['useOnly'] == 'INCLUSION_BY_RESOURCE_TYPES'
+
+
+def test_daily_override_is_emitted_when_daily_types_present(recorder_env):
+    recorder_env(
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
+        CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::S3::Bucket',
+    )
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+
+    override = payload['recordingMode']['recordingModeOverrides'][0]
+    assert override['recordingFrequency'] == 'DAILY'
+    assert override['resourceTypes'] == ['AWS::S3::Bucket']
+
+
+def test_no_recording_mode_when_no_daily_types(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+
+    assert 'recordingMode' not in payload
