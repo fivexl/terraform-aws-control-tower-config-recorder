@@ -19,6 +19,9 @@ locals {
   # instead of silently double-managing every account.
   function_name = "ct-config-recorder-override"
   rule_name     = "ct-config-recorder-override-trigger"
+
+  # Both null and "" disable the schedule. See the variable for why.
+  reconciliation_enabled = try(trimspace(var.reconciliation_schedule_expression), "") != ""
 }
 
 # -----------------------------------------------------------------------------
@@ -123,12 +126,22 @@ module "lambda" {
   attach_policy_json = true
   policy_json        = data.aws_iam_policy_document.lambda_policy.json
 
-  allowed_triggers = {
-    ControlTowerEvents = {
-      principal  = "events.amazonaws.com"
-      source_arn = aws_cloudwatch_event_rule.control_tower.arn
-    }
-  }
+  allowed_triggers = merge(
+    {
+      ControlTowerEvents = {
+        principal  = "events.amazonaws.com"
+        source_arn = aws_cloudwatch_event_rule.control_tower.arn
+      }
+    },
+    local.reconciliation_enabled ? {
+      ReconciliationSchedule = {
+        principal = "events.amazonaws.com"
+        # one() rather than [0] so this is safe to evaluate when the rule count
+        # is zero.
+        source_arn = one(aws_cloudwatch_event_rule.reconciliation[*].arn)
+      }
+    } : {},
+  )
 
   cloudwatch_logs_retention_in_days = var.cloudwatch_logs_retention_in_days
 
@@ -162,11 +175,40 @@ resource "aws_cloudwatch_event_rule" "control_tower" {
   name        = local.rule_name
   description = "Rule to trigger config recorder override lambda"
 
+  # Every operation that can redeploy AWSControlTowerBP-BASELINE-CONFIG belongs
+  # here, because that StackSet is what overwrites this customization. A missing
+  # event is invisible: the function never runs, nothing fails, and the Errors
+  # alarm stays quiet while the recorder sits reverted.
+  #
+  # detail-type matters. Lifecycle events are non-API service events, published as
+  # "AWS Service Event via CloudTrail". Control Tower API calls are published as
+  # "AWS API Call via CloudTrail" and would not match this rule.
   event_pattern = jsonencode({
     source      = ["aws.controltower"]
     detail-type = ["AWS Service Event via CloudTrail"]
     detail = {
-      eventName = ["UpdateLandingZone", "CreateManagedAccount", "UpdateManagedAccount", "ResetLandingZone"]
+      eventName = [
+        # Account factory: a new or re-enrolled account gets the baseline.
+        "CreateManagedAccount",
+        "UpdateManagedAccount",
+        # Landing zone update re-applies baselines across the organization.
+        "UpdateLandingZone",
+        # Not in the documented lifecycle event list, and ResetLandingZone is an
+        # API operation, which CloudTrail publishes under the other detail-type.
+        # Retained anyway: an unmatched name costs nothing, and removing it would
+        # be a bet against undocumented behaviour. A reset should reach us through
+        # the landing zone, OU and baseline events it triggers.
+        "ResetLandingZone",
+        # Extending governance to an OU enrolls its accounts and deploys the
+        # Config baseline to each one.
+        "RegisterOrganizationalUnit",
+        # Baseline operations redeploy the Config baseline directly. These were
+        # the gap: they are newer than the events above and can revert every
+        # targeted account.
+        "EnableBaseline",
+        "ResetEnabledBaseline",
+        "UpdateEnabledBaseline",
+      ]
     }
   })
 
@@ -184,6 +226,41 @@ resource "aws_cloudwatch_event_target" "lambda" {
     maximum_retry_attempts       = var.eventbridge_maximum_retry_attempts
     maximum_event_age_in_seconds = var.eventbridge_maximum_event_age_in_seconds
   }
+}
+
+# -----------------------------------------------------------------------------
+# Reconciliation schedule
+#
+# The event list above is a moving target: Control Tower has added lifecycle
+# events over time, and the baseline events were missing here until 4.0.0. A
+# missed event is silent, because the function simply never runs. Nothing fails,
+# so the Errors alarm cannot help, and an unchanged `terraform apply` will not
+# re-invoke either, since the apply-time trigger keys on the source code hash.
+#
+# This schedule bounds that exposure without needing to predict the event list.
+# put_configuration_recorder is idempotent, so re-applying the same settings is a
+# no-op beyond the API calls.
+# -----------------------------------------------------------------------------
+
+resource "aws_cloudwatch_event_rule" "reconciliation" {
+  count = local.reconciliation_enabled ? 1 : 0
+
+  name                = "${local.function_name}-reconciliation"
+  description         = "Periodically re-apply Config Recorder settings so a missed Control Tower event cannot leave them reverted indefinitely"
+  schedule_expression = var.reconciliation_schedule_expression
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_event_target" "reconciliation" {
+  count = local.reconciliation_enabled ? 1 : 0
+
+  rule = aws_cloudwatch_event_rule.reconciliation[0].name
+  arn  = module.lambda.lambda_function_arn
+
+  # Same event the apply-time invocation sends, which the function reads as its
+  # default action.
+  input = jsonencode({ action = "apply" })
 }
 
 # -----------------------------------------------------------------------------

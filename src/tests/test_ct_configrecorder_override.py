@@ -12,6 +12,8 @@ from ct_configrecorder_override import (
     build_recorder_payload,
     get_account_session,
     get_caller_identity,
+    lifecycle_event_account,
+    lifecycle_event_state,
     parse_account_list,
     should_process_account,
     summarise_run,
@@ -433,3 +435,186 @@ def test_no_recording_mode_when_nothing_is_configured(recorder_env):
         'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
 
     assert 'recordingMode' not in payload
+
+
+# --- lifecycle event parsing -------------------------------------------------
+#
+# Control Tower lifecycle events do not share a payload shape. The account events
+# carry account.accountId and state, the baseline events carry an Organizations ARN
+# in enabledBaselineDetails.targetIdentifier with the status nested under
+# statusSummary.status, and the OU and landing zone events name no single account
+# at all. Every shape below is taken from the AWS documented examples.
+
+def lifecycle_event(event_name, status_payload):
+    """Wrap a serviceEventDetails payload in the EventBridge envelope."""
+    return {
+        'source': 'aws.controltower',
+        'detail': {
+            'eventName': event_name,
+            'serviceEventDetails': status_payload,
+        },
+    }
+
+
+CREATE_MANAGED_ACCOUNT = lifecycle_event('CreateManagedAccount', {
+    'createManagedAccountStatus': {
+        'organizationalUnit': {'organizationalUnitName': 'Custom', 'organizationalUnitId': 'ou-1'},
+        'account': {'accountName': 'workload', 'accountId': '444455556666'},
+        'state': 'SUCCEEDED',
+    },
+})
+
+ENABLE_BASELINE = lifecycle_event('EnableBaseline', {
+    'enableBaselineStatus': {
+        'enabledBaselineDetails': {
+            'targetIdentifier': 'arn:aws:organizations::111122223333:account/o-abc123/444455556666',
+            'statusSummary': {'status': 'SUCCEEDED'},
+        },
+    },
+})
+
+RESET_ENABLED_BASELINE_ON_OU = lifecycle_event('ResetEnabledBaseline', {
+    'resetEnabledBaselineStatus': {
+        'enabledBaselineDetails': {
+            'targetIdentifier': 'arn:aws:organizations::111122223333:ou/o-abc123/ou-abc1-22223333',
+            'statusSummary': {'status': 'SUCCEEDED'},
+        },
+    },
+})
+
+REGISTER_ORGANIZATIONAL_UNIT = lifecycle_event('RegisterOrganizationalUnit', {
+    'registerOrganizationalUnitStatus': {
+        'state': 'SUCCEEDED',
+        'organizationalUnit': {'organizationalUnitName': 'Test', 'organizationalUnitId': 'ou-1'},
+    },
+})
+
+UPDATE_LANDING_ZONE = lifecycle_event('UpdateLandingZone', {
+    'updateLandingZoneStatus': {
+        'state': 'SUCCEEDED',
+        'rootOrganizationalId': 'r-1234',
+        # Note the plural: a list of accounts, not a single 'account' object.
+        'accounts': [
+            {'accountName': 'Audit', 'accountId': '444455556666'},
+            {'accountName': 'Log archive', 'accountId': '777788889999'},
+        ],
+    },
+})
+
+
+def test_managed_account_event_yields_its_account():
+    assert lifecycle_event_account(CREATE_MANAGED_ACCOUNT) == '444455556666'
+
+
+def test_baseline_event_account_is_parsed_from_the_target_arn():
+    assert lifecycle_event_account(ENABLE_BASELINE) == '444455556666'
+
+
+def test_baseline_event_on_an_ou_falls_back_to_all_accounts():
+    """An OU-level baseline has no single account, so the whole org is walked."""
+    assert lifecycle_event_account(RESET_ENABLED_BASELINE_ON_OU) == ''
+
+
+def test_ou_registration_falls_back_to_all_accounts():
+    assert lifecycle_event_account(REGISTER_ORGANIZATIONAL_UNIT) == ''
+
+
+def test_landing_zone_account_list_is_not_read_as_a_single_account():
+    """
+    The landing zone events carry 'accounts' as a list. Reading the first of them
+    as the target would update one account and skip the rest.
+    """
+    assert lifecycle_event_account(UPDATE_LANDING_ZONE) == ''
+
+
+def test_state_is_read_from_both_shapes():
+    assert lifecycle_event_state(CREATE_MANAGED_ACCOUNT) == 'SUCCEEDED'
+    assert lifecycle_event_state(REGISTER_ORGANIZATIONAL_UNIT) == 'SUCCEEDED'
+    # Nested under statusSummary on the baseline events, not 'state'.
+    assert lifecycle_event_state(ENABLE_BASELINE) == 'SUCCEEDED'
+
+
+def test_failed_state_is_reported_from_both_shapes():
+    failed_account = lifecycle_event('CreateManagedAccount', {
+        'createManagedAccountStatus': {'state': 'FAILED'},
+    })
+    failed_baseline = lifecycle_event('EnableBaseline', {
+        'enableBaselineStatus': {
+            'enabledBaselineDetails': {'statusSummary': {'status': 'FAILED'}},
+        },
+    })
+
+    assert lifecycle_event_state(failed_account) == 'FAILED'
+    assert lifecycle_event_state(failed_baseline) == 'FAILED'
+
+
+def test_unreadable_state_returns_none_rather_than_failing():
+    """
+    None means "process it anyway". Dropping an unrecognised shape would leave the
+    recorder reverted silently, which is the failure this function exists to stop.
+    """
+    assert lifecycle_event_state(lifecycle_event('SomethingNew', {'newStatus': {}})) is None
+    assert lifecycle_event_state({'source': 'aws.controltower', 'detail': {}}) is None
+
+
+def test_unknown_event_shape_still_yields_an_org_wide_walk():
+    assert lifecycle_event_account(lifecycle_event('SomethingNew', {'newStatus': {}})) == ''
+
+
+# --- lambda_handler dispatch --------------------------------------------------
+
+@pytest.fixture
+def captured_process(monkeypatch):
+    """Replace process_accounts and record the account scope it was called with."""
+    calls = []
+
+    def _fake(selection_mode, excluded, included, account, event_type):
+        calls.append({'account': account, 'event_type': event_type})
+        return {'updated': 1, 'failed': 0, 'failures': [], 'fatal': None}
+
+    monkeypatch.setattr(mod, 'process_accounts', _fake)
+    return calls
+
+
+def test_handler_skips_failed_lifecycle_events(captured_process):
+    """
+    A failed operation applied no baseline, so there is nothing to override.
+    Processing it anyway would assume a role in an account that may not exist yet,
+    failing the run and tripping the error alarm for no reason.
+    """
+    event = lifecycle_event('CreateManagedAccount', {
+        'createManagedAccountStatus': {
+            'account': {'accountId': '444455556666'},
+            'state': 'FAILED',
+        },
+    })
+
+    result = mod.lambda_handler(event, None)
+
+    assert captured_process == []
+    assert result['skipped'] == 'CreateManagedAccount'
+
+
+def test_handler_narrows_to_one_account_for_baseline_events(captured_process):
+    mod.lambda_handler(ENABLE_BASELINE, None)
+
+    assert captured_process == [{'account': '444455556666', 'event_type': 'controltower'}]
+
+
+def test_handler_walks_all_accounts_for_ou_registration(captured_process):
+    mod.lambda_handler(REGISTER_ORGANIZATIONAL_UNIT, None)
+
+    assert captured_process == [{'account': '', 'event_type': 'controltower'}]
+
+
+def test_handler_treats_a_schedule_or_manual_event_as_a_full_apply(captured_process):
+    """The reconciliation schedule sends exactly this payload."""
+    mod.lambda_handler({'action': 'apply'}, None)
+
+    assert captured_process == [{'account': '', 'event_type': 'apply'}]
+
+
+def test_handler_passes_the_delete_action_through(captured_process):
+    mod.lambda_handler({'action': 'Delete'}, None)
+
+    assert captured_process == [{'account': '', 'event_type': 'Delete'}]

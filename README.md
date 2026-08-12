@@ -25,7 +25,8 @@ Originally based on the AWS blog post: https://aws.amazon.com/blogs/mt/customize
 
 The solution deploys:
 - A **Lambda function** (via [terraform-aws-modules/lambda/aws](https://registry.terraform.io/modules/terraform-aws-modules/lambda/aws)) that assumes the `AWSControlTowerExecution` role into each target account and updates the Config Recorder
-- An **EventBridge rule** that triggers the Lambda on Control Tower lifecycle events (CreateManagedAccount, UpdateManagedAccount, UpdateLandingZone, ResetLandingZone)
+- An **EventBridge rule** that triggers the Lambda on the Control Tower lifecycle events that can redeploy the Config baseline: `CreateManagedAccount`, `UpdateManagedAccount`, `UpdateLandingZone`, `RegisterOrganizationalUnit`, `EnableBaseline`, `ResetEnabledBaseline` and `UpdateEnabledBaseline`
+- An **EventBridge schedule** that periodically re-applies the settings, so a lifecycle event that never arrives cannot leave them reverted indefinitely
 - A **CloudWatch alarm** on the Lambda `Errors` metric, which is the primary failure signal
 - A **terraform_data resource** that invokes the Lambda on apply when the function code or configuration changes
 
@@ -78,6 +79,21 @@ Runtime is roughly `accounts × 1s` for the `AssumeRole` throttle delay, plus tw
 
 `lambda_memory_size` is not a function of organization size: the function holds one cached session per account and one settings dict per region, so memory stays roughly flat. Raise it to buy CPU, not headroom.
 
+### Staying applied
+
+Control Tower owns the `AWSControlTowerBP-BASELINE-CONFIG` StackSet. Anything that redeploys it resets the Config Recorder to the Control Tower default and discards this customization, so the module has to run again afterwards. The rule therefore subscribes to every [lifecycle event](https://docs.aws.amazon.com/controltower/latest/userguide/lifecycle-events.html) that can cause a redeploy, including the baseline events (`EnableBaseline`, `ResetEnabledBaseline`, `UpdateEnabledBaseline`) and OU registration, not just account creation.
+
+Only successful lifecycle events are acted on. A failed Control Tower operation applied no baseline, so there is nothing to override, and assuming a role into a half-provisioned account would fail the run and trip the error alarm for no reason.
+
+Two things make a missed event worse than it sounds, which is why the schedule exists:
+
+- A missed event is silent. The function simply never runs, so nothing fails and the `Errors` alarm cannot tell you.
+- An unchanged `terraform apply` will not fix it either. The apply-time invocation keys on the function's source code hash, so it only fires when the module itself changes.
+
+`reconciliation_schedule_expression` (default `rate(12 hours)`) re-invokes the function on a timer, which bounds how long drift can last without needing to predict AWS's event list. That list has grown before — the baseline events are recent additions. Re-applying is idempotent, and at 52 accounts across 4 regions a run costs about 416 Config API calls. Set the variable to `null` to disable it and rely solely on lifecycle events.
+
+Lifecycle events only reach EventBridge if you have an active CloudTrail trail with logging enabled. Control Tower creates an organization trail by default, but if CloudTrail was turned off in your landing zone settings, none of these events arrive and the schedule becomes the only trigger.
+
 ### Failure handling
 
 The apply-time invocation is asynchronous, so Terraform does not wait for the function and never sees its result. That means **a failed run will not fail your apply**. The signal is instead:
@@ -93,6 +109,7 @@ Set `create_error_alarm = false` if you monitor Lambda errors through some other
 - Terraform >= 1.5.0
 - AWS provider >= 6.0
 - Credentials for the Control Tower **management account**. The function calls `ListStackInstances` without `CallAs`, so running from a delegated administrator account is not supported.
+- An active **CloudTrail trail with logging enabled**, which is what delivers Control Tower lifecycle events to EventBridge. Control Tower creates an organization trail by default. Without it the module only runs on apply and on the reconciliation schedule.
 - AWS CLI on the machine running Terraform, if `invoke_on_apply` is left enabled (the default). Set `invoke_on_apply = false` to remove that dependency and rely solely on Control Tower lifecycle events.
 
 ## Account targeting is checked at plan time
@@ -217,7 +234,9 @@ Resource addresses also changed in 2.0.0 when the Lambda moved into `terraform-a
 | Name | Type |
 | ---- | ---- |
 | [aws_cloudwatch_event_rule.control_tower](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_rule) | resource |
+| [aws_cloudwatch_event_rule.reconciliation](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_rule) | resource |
 | [aws_cloudwatch_event_target.lambda](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_target) | resource |
+| [aws_cloudwatch_event_target.reconciliation](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_target) | resource |
 | [aws_cloudwatch_metric_alarm.lambda_errors](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
 | [terraform_data.invoke_lambda](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
 | [terraform_data.validate_configuration](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
@@ -250,6 +269,7 @@ Resource addresses also changed in 2.0.0 when the Lambda moved into `terraform-a
 | <a name="input_lambda_maximum_retry_attempts"></a> [lambda\_maximum\_retry\_attempts](#input\_lambda\_maximum\_retry\_attempts) | Number of times Lambda retries a failed asynchronous invocation (0-2). Updating the Config Recorder is idempotent, so retrying is safe. | `number` | `2` | no |
 | <a name="input_lambda_memory_size"></a> [lambda\_memory\_size](#input\_lambda\_memory\_size) | Memory in MB allocated to the Lambda function. The function holds one cached session per account and one settings dict per region, so memory is roughly flat in the number of accounts; this mainly buys CPU. | `number` | `1024` | no |
 | <a name="input_log_level"></a> [log\_level](#input\_log\_level) | Log level for the Lambda function. DEBUG is safe to enable: the AWS SDK loggers are pinned above DEBUG so temporary credentials are never written to CloudWatch Logs. | `string` | `"INFO"` | no |
+| <a name="input_reconciliation_schedule_expression"></a> [reconciliation\_schedule\_expression](#input\_reconciliation\_schedule\_expression) | EventBridge schedule for periodically re-applying Config Recorder settings, for example rate(12 hours) or cron(0 3 * * ? *). Control Tower keeps adding lifecycle events, and a missed one leaves the recorder reverted with nothing on the Errors metric to show it, so this bounds how long that can last. Re-applying is idempotent. Set to null or an empty string to disable and rely solely on lifecycle events. | `string` | `"rate(12 hours)"` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | A map of tags to add to all resources created by this module | `map(string)` | `{}` | no |
 
 ## Outputs
@@ -258,10 +278,11 @@ Resource addresses also changed in 2.0.0 when the Lambda moved into `terraform-a
 | ---- | ----------- |
 | <a name="output_control_tower_home_region"></a> [control\_tower\_home\_region](#output\_control\_tower\_home\_region) | Region treated as the Control Tower home region, where global resource types are recorded |
 | <a name="output_error_alarm_arn"></a> [error\_alarm\_arn](#output\_error\_alarm\_arn) | ARN of the CloudWatch alarm on the Lambda Errors metric, or null when create\_error\_alarm is false |
-| <a name="output_eventbridge_rule_arn"></a> [eventbridge\_rule\_arn](#output\_eventbridge\_rule\_arn) | ARN of the EventBridge rule that triggers the Lambda |
+| <a name="output_eventbridge_rule_arn"></a> [eventbridge\_rule\_arn](#output\_eventbridge\_rule\_arn) | ARN of the EventBridge rule that triggers the Lambda on Control Tower lifecycle events |
 | <a name="output_lambda_function_arn"></a> [lambda\_function\_arn](#output\_lambda\_function\_arn) | ARN of the Config Recorder override Lambda function |
 | <a name="output_lambda_function_name"></a> [lambda\_function\_name](#output\_lambda\_function\_name) | Name of the Config Recorder override Lambda function |
 | <a name="output_lambda_role_arn"></a> [lambda\_role\_arn](#output\_lambda\_role\_arn) | ARN of the IAM role created for the Lambda function |
+| <a name="output_reconciliation_rule_arn"></a> [reconciliation\_rule\_arn](#output\_reconciliation\_rule\_arn) | ARN of the EventBridge schedule that periodically re-applies Config Recorder settings, or null when reconciliation\_schedule\_expression is null |
 <!-- END_TF_DOCS -->
 
 ## Account Selection Modes
@@ -309,11 +330,13 @@ These have special roles in Control Tower governance and should maintain default
 
 1. **On `terraform apply`**: The Lambda is invoked asynchronously via `local-exec`, iterates all accounts from the `AWSControlTowerBP-BASELINE-CONFIG` StackSet, and applies the Config Recorder configuration. Because the invocation is asynchronous, Terraform does not wait for it — see [Failure handling](#failure-handling).
 
-2. **On Control Tower events**: EventBridge triggers the Lambda when accounts are created/updated or the landing zone is updated/reset. The Lambda processes the affected account(s).
+2. **On Control Tower events**: EventBridge triggers the Lambda when an account is created or updated, a baseline is enabled, reset or updated, an OU is registered, or the landing zone is updated. Events that name a single account are narrowed to it; OU and landing zone events walk the whole organization. Failed lifecycle events are ignored.
 
-3. **Per-account processing**: For each account, the Lambda assumes the `AWSControlTowerExecution` role once, reads the existing Config Recorder in each region, and updates it according to the configured strategy and resource type lists.
+3. **On a schedule**: the reconciliation rule re-invokes the function on a timer so a missed event cannot leave the recorder reverted indefinitely. See [Staying applied](#staying-applied).
 
-4. **Reporting**: Per-account failures are collected rather than raised immediately, so one bad account does not stop the run. At the end, the function raises if anything failed, which surfaces on the Lambda `Errors` metric.
+4. **Per-account processing**: For each account, the Lambda assumes the `AWSControlTowerExecution` role once, reads the existing Config Recorder in each region, and updates it according to the configured strategy and resource type lists.
+
+5. **Reporting**: Per-account failures are collected rather than raised immediately, so one bad account does not stop the run. At the end, the function raises if anything failed, which surfaces on the Lambda `Errors` metric.
 
 Note that the function skips the account it runs in, so the management account is never modified regardless of your `excluded_accounts` setting.
 

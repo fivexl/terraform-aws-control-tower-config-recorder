@@ -4,10 +4,17 @@ AWS Config Recorder Override for Control Tower environments.
 This Lambda function customizes AWS Config Recorder settings across child accounts
 managed by AWS Control Tower. It is triggered by:
 
-1. EventBridge rules on Control Tower lifecycle events (CreateManagedAccount,
-   UpdateManagedAccount, UpdateLandingZone, ResetLandingZone)
-2. Direct invocation from Terraform (via local-exec on apply)
-3. Manual invocation for ad-hoc operations (e.g., resetting accounts with action=Delete)
+1. EventBridge rules on Control Tower lifecycle events. Any operation that can
+   redeploy AWSControlTowerBP-BASELINE-CONFIG has to be covered, because that
+   StackSet is what overwrites this customization: the account events
+   (CreateManagedAccount, UpdateManagedAccount), the landing zone events
+   (UpdateLandingZone), OU registration (RegisterOrganizationalUnit) and the
+   baseline events (EnableBaseline, ResetEnabledBaseline, UpdateEnabledBaseline).
+2. A periodic reconciliation schedule, so that an event AWS adds in future, or one
+   lost because CloudTrail logging was off, cannot leave the recorder reverted
+   indefinitely. A missed event produces no error, so nothing else would notice.
+3. Direct invocation from Terraform (via local-exec on apply)
+4. Manual invocation for ad-hoc operations (e.g., resetting accounts with action=Delete)
 
 The function iterates accounts from the AWSControlTowerBP-BASELINE-CONFIG StackSet,
 assumes the AWSControlTowerExecution role in each target account, and updates the
@@ -85,6 +92,11 @@ GLOBAL_IAM_RESOURCE_TYPES = (
 
 # Seconds to wait after an AssumeRole call to stay clear of STS request-rate limits.
 ASSUME_ROLE_THROTTLE_DELAY = 1
+
+# A lifecycle event marks the completion of a Control Tower operation and reports
+# whether it succeeded or failed. Only a success means a baseline was applied and
+# therefore needs overriding again.
+LIFECYCLE_SUCCESS_STATE = 'SUCCEEDED'
 
 # The AWS SDK logs raw HTTP request and response bodies at DEBUG level
 # (botocore.parsers logs 'Response body'). The AssumeRole response body contains
@@ -554,20 +566,119 @@ def parse_account_list(raw_value, label):
     return [str(item) for item in parsed]
 
 
-def lifecycle_event_account(event, status_key):
+def _lifecycle_status_payloads(event):
     """
-    Pull the account ID out of a Control Tower lifecycle event.
+    Yield the status objects nested under serviceEventDetails.
 
-    Create and Update events carry the same shape under different status keys.
+    Every Control Tower lifecycle event carries exactly one such object, named
+    after the originating operation (createManagedAccountStatus,
+    enableBaselineStatus, and so on).
+    """
+    details = event.get('detail', {}).get('serviceEventDetails') or {}
+    if not isinstance(details, dict):
+        return
+
+    for payload in details.values():
+        if isinstance(payload, dict):
+            yield payload
+
+
+def lifecycle_event_state(event):
+    """
+    Return the completion state of a Control Tower lifecycle event.
+
+    The field differs by event family: the account, OU and landing zone events
+    carry 'state', while the baseline events nest it at
+    enabledBaselineDetails.statusSummary.status.
+
+    Returns None when no state can be read, which the caller treats as "process
+    it anyway". Failing open is deliberate. Dropping an event whose shape we did
+    not recognise would leave the Config Recorder reverted with nothing on the
+    Errors metric to show it, which is the failure mode this whole function
+    exists to prevent.
 
     Args:
         event (dict): The EventBridge event
-        status_key (str): 'createManagedAccountStatus' or 'updateManagedAccountStatus'
 
     Returns:
-        str: The affected account ID
+        str|None: 'SUCCEEDED', 'FAILED', or None if not present
     """
-    return event['detail']['serviceEventDetails'][status_key]['account']['accountId']
+    for payload in _lifecycle_status_payloads(event):
+        if 'state' in payload:
+            return payload['state']
+
+        summary = (payload.get('enabledBaselineDetails') or {}).get('statusSummary') or {}
+        if 'status' in summary:
+            return summary['status']
+
+    return None
+
+
+def _account_from_target_identifier(target_identifier):
+    """
+    Pull the account ID out of a baseline event targetIdentifier ARN.
+
+    The target is either an account, for example
+    arn:aws:organizations::111122223333:account/o-abc123/444455556666, or an OU.
+    An OU target means the baseline was applied at OU level, so there is no single
+    account to narrow to and the caller walks the whole organization instead.
+
+    Args:
+        target_identifier (str): Organizations ARN of the baseline target
+
+    Returns:
+        str: Account ID, or '' when the target is not a single account
+    """
+    resource = target_identifier.rsplit(':', 1)[-1]
+    kind, _, path = resource.partition('/')
+
+    if kind == 'account' and path:
+        return path.rsplit('/', 1)[-1]
+
+    return ''
+
+
+def lifecycle_event_account(event):
+    """
+    Return the account a lifecycle event targets, or '' when it is organization-wide.
+
+    Three shapes are in play:
+
+        CreateManagedAccount, UpdateManagedAccount
+            account.accountId
+        EnableBaseline, ResetEnabledBaseline, UpdateEnabledBaseline
+            enabledBaselineDetails.targetIdentifier, an Organizations ARN
+        RegisterOrganizationalUnit, UpdateLandingZone, SetupLandingZone
+            no single account: an organizationalUnit, or an 'accounts' list
+
+    This reads whichever shape is present rather than switching on the event
+    name, so an event type AWS adds later still resolves without a code change.
+    That matters because the list has grown before: the baseline events are recent
+    additions, and missing them is what let a baseline redeploy silently revert
+    this customization.
+
+    '' is passed straight through to process_accounts, which then walks every
+    account in the StackSet. That is the right fallback for OU registration and
+    landing zone updates, which affect many accounts at once.
+
+    Args:
+        event (dict): The EventBridge event
+
+    Returns:
+        str: The affected account ID, or '' for organization-wide events
+    """
+    for payload in _lifecycle_status_payloads(event):
+        # 'account' is a single object. Note that the landing zone events instead
+        # carry 'accounts', a list, which correctly does not match here.
+        account = (payload.get('account') or {}).get('accountId')
+        if account:
+            return str(account)
+
+        target = (payload.get('enabledBaselineDetails') or {}).get('targetIdentifier')
+        if target:
+            return _account_from_target_identifier(target)
+
+    return ''
 
 
 def summarise_run(result):
@@ -622,30 +733,36 @@ def lambda_handler(event, context):
         if event_source:
             logger.info(f'Control Tower event {event_source}/{event_name}')
 
-        match (event_source, event_name):
-            case ('aws.controltower', 'UpdateManagedAccount'):
-                account = lifecycle_event_account(event, 'updateManagedAccountStatus')
-                logger.info(f'Overriding config recorder for SINGLE account: {account}')
-                result = process_accounts(
-                    selection_mode, excluded_accounts, included_accounts, account, 'controltower')
+        if event_source == 'aws.controltower':
+            state = lifecycle_event_state(event)
 
-            case ('aws.controltower', 'CreateManagedAccount'):
-                account = lifecycle_event_account(event, 'createManagedAccountStatus')
-                logger.info(f'Overriding config recorder for SINGLE account: {account}')
-                result = process_accounts(
-                    selection_mode, excluded_accounts, included_accounts, account, 'controltower')
+            if state is not None and state.upper() != LIFECYCLE_SUCCESS_STATE:
+                # A lifecycle event records the completion of an operation, so a
+                # failed one means the baseline was not applied and there is
+                # nothing to override. Acting on it would assume a role in an
+                # account that may not be provisioned, which would fail the run
+                # and trip the error alarm for no reason.
+                logger.warning(
+                    f'Ignoring {event_name} lifecycle event in state {state}')
+                return {'statusCode': 200, 'updated': 0, 'failed': 0, 'skipped': event_name}
 
-            case ('aws.controltower', 'UpdateLandingZone' | 'ResetLandingZone'):
-                logger.info(f'Overriding config recorder for ALL accounts due to {event_name} event')
-                result = process_accounts(
-                    selection_mode, excluded_accounts, included_accounts, '', 'controltower')
+            if state is None:
+                # Processed rather than dropped: see lifecycle_event_state.
+                logger.warning(f'No lifecycle state found on {event_name}, processing anyway')
 
-            case _:
-                # Direct invocation (e.g., from Terraform local-exec or manual trigger)
-                action = event.get('action', 'apply')
-                logger.info(f'Direct invocation with action: {action}')
-                result = process_accounts(
-                    selection_mode, excluded_accounts, included_accounts, '', action)
+            account = lifecycle_event_account(event)
+            scope = f'SINGLE account {account}' if account else 'ALL accounts'
+            logger.info(f'Overriding config recorder for {scope} due to {event_name}')
+            result = process_accounts(
+                selection_mode, excluded_accounts, included_accounts, account, 'controltower')
+
+        else:
+            # Direct invocation: Terraform local-exec, the reconciliation
+            # schedule, or a manual trigger such as {"action": "Delete"}.
+            action = event.get('action', 'apply')
+            logger.info(f'Direct invocation with action: {action}')
+            result = process_accounts(
+                selection_mode, excluded_accounts, included_accounts, '', action)
 
         return summarise_run(result)
 

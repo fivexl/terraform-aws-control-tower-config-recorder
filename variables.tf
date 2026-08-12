@@ -178,6 +178,23 @@ variable "eventbridge_maximum_retry_attempts" {
   default     = 10
 }
 
+variable "reconciliation_schedule_expression" {
+  description = "EventBridge schedule for periodically re-applying Config Recorder settings, for example rate(12 hours) or cron(0 3 * * ? *). Control Tower keeps adding lifecycle events, and a missed one leaves the recorder reverted with nothing on the Errors metric to show it, so this bounds how long that can last. Re-applying is idempotent. Set to null or an empty string to disable and rely solely on lifecycle events."
+  type        = string
+  default     = "rate(12 hours)"
+
+  # Empty string disables as well as null, because `-var x=null` on the command
+  # line passes the literal string "null" rather than a null value.
+  validation {
+    condition = (
+      var.reconciliation_schedule_expression == null ||
+      var.reconciliation_schedule_expression == "" ||
+      can(regex("^(rate|cron)\\(", var.reconciliation_schedule_expression))
+    )
+    error_message = "Must be an EventBridge schedule expression starting with rate( or cron(, or null or \"\" to disable."
+  }
+}
+
 variable "eventbridge_maximum_event_age_in_seconds" {
   description = "Maximum age of a Control Tower event EventBridge will still attempt to deliver (60-86400)."
   type        = number
