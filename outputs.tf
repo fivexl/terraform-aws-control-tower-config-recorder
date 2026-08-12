@@ -14,8 +14,13 @@ output "lambda_role_arn" {
 }
 
 output "eventbridge_rule_arn" {
-  description = "ARN of the EventBridge rule that triggers the Lambda"
+  description = "ARN of the EventBridge rule that triggers the Lambda on Control Tower lifecycle events"
   value       = aws_cloudwatch_event_rule.control_tower.arn
+}
+
+output "reconciliation_rule_arn" {
+  description = "ARN of the EventBridge schedule that periodically re-applies Config Recorder settings, or null when reconciliation_schedule_expression is null"
+  value       = one(aws_cloudwatch_event_rule.reconciliation[*].arn)
 }
 
 output "error_alarm_arn" {
@@ -24,6 +29,11 @@ output "error_alarm_arn" {
 }
 
 output "control_tower_home_region" {
-  description = "Region treated as the Control Tower home region, where global resource types are recorded"
+  description = "Region treated as the Control Tower home region"
   value       = local.control_tower_home_region
+}
+
+output "global_iam_recording_region" {
+  description = "Region that records the global IAM resource types, or an empty string when no region records them"
+  value       = local.global_iam_recording_region
 }

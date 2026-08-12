@@ -3,14 +3,18 @@
 import logging
 
 import pytest
+from conftest import HOME_REGION, OTHER_REGION
 
 import ct_configrecorder_override as mod
 from ct_configrecorder_override import (
     ConfigRecorderUpdateError,
     build_recorder_config,
     build_recorder_payload,
+    check_global_iam_region,
     get_account_session,
     get_caller_identity,
+    lifecycle_event_account,
+    lifecycle_event_state,
     parse_account_list,
     should_process_account,
     summarise_run,
@@ -191,47 +195,260 @@ def test_summarise_run_succeeds_when_nothing_matched():
 
 # --- build_recorder_config ---------------------------------------------------
 
-def test_exclusion_strategy_drops_daily_types_that_are_excluded(recorder_env):
+def test_exclusion_strategy_drops_override_types_that_are_excluded(recorder_env):
     recorder_env(
         CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::EC2::Volume,AWS::S3::Bucket',
         CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
     )
-    assert build_recorder_config('eu-west-1')['daily'] == ['AWS::S3::Bucket']
+    assert build_recorder_config(OTHER_REGION)['override_types'] == ['AWS::S3::Bucket']
 
 
-def test_global_daily_types_added_only_in_home_region(recorder_env):
+def test_global_override_types_added_only_in_home_region(recorder_env):
     recorder_env(CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST='AWS::IAM::Role')
 
-    assert build_recorder_config('us-east-1')['daily'] == ['AWS::IAM::Role']
-    assert build_recorder_config('eu-west-1')['daily'] == []
+    assert build_recorder_config(HOME_REGION)['override_types'] == ['AWS::IAM::Role']
+    assert build_recorder_config(OTHER_REGION)['override_types'] == []
 
 
-def test_inclusion_strategy_adds_daily_types_to_inclusion_list(recorder_env):
+def test_global_override_types_are_filtered_by_the_exclusion_list(recorder_env):
+    """
+    A type named in both lists was previously appended after the exclusion filter
+    ran, producing a cadence override for a type that is not recorded at all.
+    """
+    recorder_env(
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::IAM::Role',
+        CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST='AWS::IAM::Role',
+    )
+    assert build_recorder_config(HOME_REGION)['override_types'] == []
+
+
+def test_override_types_are_not_duplicated_across_the_two_lists(recorder_env):
+    recorder_env(
+        CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::IAM::Role',
+        CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST='AWS::IAM::Role',
+    )
+    assert build_recorder_config(HOME_REGION)['override_types'] == ['AWS::IAM::Role']
+
+
+def test_override_frequency_is_read_from_the_environment(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY='CONTINUOUS')
+    assert build_recorder_config(HOME_REGION)['override_frequency'] == 'CONTINUOUS'
+
+
+def test_inclusion_strategy_adds_override_types_to_inclusion_list(recorder_env):
     recorder_env(
         CONFIG_RECORDER_STRATEGY='INCLUSION',
         CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST='AWS::S3::Bucket',
         CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::EC2::Volume',
     )
-    assert build_recorder_config('eu-west-1')['inclusion'] == [
+    assert build_recorder_config(OTHER_REGION)['inclusion'] == [
         'AWS::S3::Bucket', 'AWS::EC2::Volume']
+
+
+# --- global IAM resource types ------------------------------------------------
+#
+# includeGlobalResourceTypes is ignored under EXCLUSION_BY_RESOURCE_TYPES, so the
+# only way to stop the global IAM types being recorded in every governed region is
+# to name them as exclusions outside the nominated region.
+
+def test_global_iam_types_are_excluded_outside_the_home_region(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
+
+    exclusion = build_recorder_config(OTHER_REGION)['exclusion']
+
+    assert exclusion[0] == 'AWS::EC2::Volume'
+    assert set(mod.GLOBAL_IAM_RESOURCE_TYPES).issubset(exclusion)
+
+
+def test_global_iam_types_are_left_recorded_in_the_home_region(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
+
+    assert build_recorder_config(HOME_REGION)['exclusion'] == ['AWS::EC2::Volume']
+
+
+def test_global_iam_exclusions_are_not_duplicated(recorder_env):
+    """An operator who already excluded a global type must not get it twice."""
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::IAM::Role')
+
+    exclusion = build_recorder_config(OTHER_REGION)['exclusion']
+
+    assert exclusion.count('AWS::IAM::Role') == 1
+    assert len(exclusion) == len(mod.GLOBAL_IAM_RESOURCE_TYPES)
+
+
+def test_global_iam_types_are_not_excluded_when_nothing_else_is(recorder_env):
+    """
+    With an empty exclusion list the payload uses allSupported instead, where
+    includeGlobalResourceTypes does work. Injecting exclusions here would switch
+    strategies behind the operator's back.
+    """
+    recorder_env()
+
+    assert build_recorder_config(OTHER_REGION)['exclusion'] == []
+
+
+def test_global_iam_types_are_not_excluded_under_inclusion_strategy(recorder_env):
+    recorder_env(
+        CONFIG_RECORDER_STRATEGY='INCLUSION',
+        CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST='AWS::S3::Bucket',
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
+    )
+
+    assert build_recorder_config(OTHER_REGION)['exclusion'] == ['AWS::EC2::Volume']
+
+
+@pytest.mark.parametrize('region', [HOME_REGION, OTHER_REGION])
+def test_no_region_records_global_iam_types_when_the_region_is_empty(recorder_env, region):
+    """
+    An empty region is a deliberate "nowhere", which is the only option when
+    Control Tower is homed where AWS cannot record the global IAM types. No region
+    may then claim to be the one recording them.
+    """
+    recorder_env(
+        GLOBAL_IAM_RECORDING_REGION='',
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
+    )
+    config = build_recorder_config(region)
+
+    assert config['is_global_iam_region'] is False
+    assert set(mod.GLOBAL_IAM_RESOURCE_TYPES).issubset(config['exclusion'])
+
+
+@pytest.mark.parametrize('region', [HOME_REGION, OTHER_REGION])
+def test_empty_region_keeps_global_types_out_of_the_all_supported_payload(recorder_env, region):
+    recorder_env(GLOBAL_IAM_RECORDING_REGION='')
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(region), 'apply')
+
+    assert payload['recordingGroup']['includeGlobalResourceTypes'] is False
+
+
+def test_global_iam_region_can_differ_from_the_home_region(recorder_env):
+    """
+    Nominating another governed region is the only way to record global IAM types
+    when Control Tower is homed in one of the regions AWS excludes.
+    """
+    recorder_env(
+        GLOBAL_IAM_RECORDING_REGION=OTHER_REGION,
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
+    )
+
+    assert build_recorder_config(OTHER_REGION)['exclusion'] == ['AWS::EC2::Volume']
+    assert set(mod.GLOBAL_IAM_RESOURCE_TYPES).issubset(
+        build_recorder_config(HOME_REGION)['exclusion'])
+
+
+# --- global IAM region assertion ---------------------------------------------
+#
+# The region is otherwise an unchecked string comparison. A typo, or a region
+# Control Tower does not govern, matches nothing, so every region excludes the
+# global IAM types and nothing records them while the run reports success.
+
+def test_missing_global_iam_region_is_reported_on_a_full_walk():
+    error = check_global_iam_region('us-east-1', {'eu-west-1', 'eu-west-2'}, False)
+
+    assert error is not None
+    assert 'us-east-1' in error
+    assert 'eu-west-1' in error
+
+
+def test_matching_global_iam_region_reports_nothing():
+    assert check_global_iam_region('eu-west-1', {'eu-west-1', 'eu-west-2'}, False) is None
+
+
+def test_single_account_run_does_not_report_a_missing_region():
+    """One account need not have a StackSet instance in every governed region."""
+    assert check_global_iam_region('us-east-1', {'eu-west-1'}, True) is None
+
+
+def test_empty_global_iam_region_is_not_treated_as_a_mistake():
+    assert check_global_iam_region('', {'eu-west-1'}, False) is None
+
+
+def test_no_regions_processed_reports_nothing():
+    """Zero accounts matched, so the region list says nothing either way."""
+    assert check_global_iam_region('us-east-1', set(), False) is None
+
+
+def test_summarise_run_raises_on_a_misconfigured_global_iam_region():
+    with pytest.raises(ConfigRecorderUpdateError, match='global IAM'):
+        summarise_run({
+            'updated': 8,
+            'failed': 0,
+            'failures': [],
+            'fatal': None,
+            'misconfigured': 'Nothing is recording the global IAM resource types',
+        })
+
+
+def test_summarise_run_reports_misconfiguration_and_failures_together():
+    """Either one hiding the other would send someone chasing half the problem."""
+    with pytest.raises(ConfigRecorderUpdateError) as exc:
+        summarise_run({
+            'updated': 3,
+            'failed': 1,
+            'failures': ['111111111111/eu-west-1: boom'],
+            'fatal': None,
+            'misconfigured': 'global IAM region not governed',
+        })
+
+    assert 'global IAM region not governed' in str(exc.value)
+    assert '1 of 4' in str(exc.value)
 
 
 # --- build_recorder_payload --------------------------------------------------
 
-def test_delete_event_resets_to_all_supported(recorder_env):
+@pytest.mark.parametrize(
+    ('region', 'expect_global'),
+    [(HOME_REGION, True), (OTHER_REGION, False)],
+)
+def test_delete_event_resets_to_control_tower_defaults(recorder_env, region, expect_global):
     recorder_env()
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'Delete')
+        'rec', 'role-arn', build_recorder_config(region), 'Delete')
 
     assert payload['recordingGroup']['allSupported'] is True
-    assert payload['recordingGroup']['includeGlobalResourceTypes'] is True
+    assert payload['recordingGroup']['includeGlobalResourceTypes'] is expect_global
     assert 'recordingMode' not in payload
+
+
+@pytest.mark.parametrize(
+    ('region', 'expect_global'),
+    [(HOME_REGION, True), (OTHER_REGION, False)],
+)
+def test_empty_exclusion_list_records_everything(recorder_env, region, expect_global):
+    """
+    An empty exclusion list must not switch global IAM recording on outside the
+    home region. Doing so silently multiplies Config cost by the number of
+    governed regions while adding no coverage, because IAM is global.
+    """
+    recorder_env()
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(region), 'apply')
+
+    group = payload['recordingGroup']
+    assert group['allSupported'] is True
+    assert group['includeGlobalResourceTypes'] is expect_global
+    assert 'exclusionByResourceTypes' not in group
+
+
+def test_delete_restores_control_tower_defaults_not_our_global_iam_choice(recorder_env):
+    """
+    Delete hands the recorder back in the state Control Tower expects, and Control
+    Tower records global types where it lives. Following our own choice of region
+    here would restore something Control Tower never configured.
+    """
+    recorder_env(GLOBAL_IAM_RECORDING_REGION='')
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'Delete')
+
+    assert payload['recordingGroup']['includeGlobalResourceTypes'] is True
 
 
 def test_exclusion_payload_uses_exclusion_strategy(recorder_env):
     recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
 
     group = payload['recordingGroup']
     assert group['allSupported'] is False
@@ -239,13 +456,13 @@ def test_exclusion_payload_uses_exclusion_strategy(recorder_env):
     assert group['exclusionByResourceTypes']['resourceTypes'] == ['AWS::EC2::Volume']
 
 
-def test_empty_exclusion_list_records_everything(recorder_env):
-    recorder_env()
+def test_exclusion_payload_excludes_global_types_outside_home_region(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(OTHER_REGION), 'apply')
 
-    assert payload['recordingGroup']['allSupported'] is True
-    assert 'exclusionByResourceTypes' not in payload['recordingGroup']
+    excluded = payload['recordingGroup']['exclusionByResourceTypes']['resourceTypes']
+    assert set(mod.GLOBAL_IAM_RESOURCE_TYPES).issubset(excluded)
 
 
 def test_inclusion_payload_uses_inclusion_strategy(recorder_env):
@@ -254,29 +471,263 @@ def test_inclusion_payload_uses_inclusion_strategy(recorder_env):
         CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST='AWS::S3::Bucket',
     )
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
 
     group = payload['recordingGroup']
     assert group['resourceTypes'] == ['AWS::S3::Bucket']
     assert group['recordingStrategy']['useOnly'] == 'INCLUSION_BY_RESOURCE_TYPES'
 
 
-def test_daily_override_is_emitted_when_daily_types_present(recorder_env):
+def test_inclusion_strategy_with_no_resource_types_raises(recorder_env):
+    """
+    The alternative is a recorder with allSupported False and no resourceTypes,
+    which records nothing at all. Failing is better than silently switching Config
+    off across an organization.
+    """
+    recorder_env(CONFIG_RECORDER_STRATEGY='INCLUSION')
+
+    with pytest.raises(ValueError, match='records nothing'):
+        build_recorder_payload(
+            'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
+
+
+# --- recording mode ----------------------------------------------------------
+
+def test_override_is_emitted_when_override_types_present(recorder_env):
     recorder_env(
         CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
         CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::S3::Bucket',
     )
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
 
+    assert payload['recordingMode']['recordingFrequency'] == 'CONTINUOUS'
     override = payload['recordingMode']['recordingModeOverrides'][0]
     assert override['recordingFrequency'] == 'DAILY'
     assert override['resourceTypes'] == ['AWS::S3::Bucket']
 
 
-def test_no_recording_mode_when_no_daily_types(recorder_env):
+def test_default_frequency_is_applied_without_any_override_types(recorder_env):
+    """
+    DAILY with both override lists empty is the natural way to say "record
+    everything once every 24 hours". Emitting no recordingMode there left every
+    recorder on continuous recording with no error and no log line.
+    """
+    recorder_env(CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY='DAILY')
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
+
+    assert payload['recordingMode']['recordingFrequency'] == 'DAILY'
+    assert 'recordingModeOverrides' not in payload['recordingMode']
+
+
+def test_override_frequency_can_be_continuous_against_a_daily_default(recorder_env):
+    """
+    Firewall Manager needs continuous recording for the types its policies cover,
+    which requires exempting specific types from an otherwise daily default.
+    """
+    recorder_env(
+        CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY='DAILY',
+        CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY='CONTINUOUS',
+        CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::EC2::VPC',
+    )
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
+
+    assert payload['recordingMode']['recordingFrequency'] == 'DAILY'
+    override = payload['recordingMode']['recordingModeOverrides'][0]
+    assert override['recordingFrequency'] == 'CONTINUOUS'
+    assert override['resourceTypes'] == ['AWS::EC2::VPC']
+    assert override['description'] == 'CONTINUOUS_OVERRIDE'
+
+
+def test_no_recording_mode_when_nothing_is_configured(recorder_env):
+    """A continuous default with no overrides is the AWS default, so send nothing."""
     recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
 
     assert 'recordingMode' not in payload
+
+
+# --- lifecycle event parsing -------------------------------------------------
+#
+# Control Tower lifecycle events do not share a payload shape. The account events
+# carry account.accountId and state, the baseline events carry an Organizations ARN
+# in enabledBaselineDetails.targetIdentifier with the status nested under
+# statusSummary.status, and the OU and landing zone events name no single account
+# at all. Every shape below is taken from the AWS documented examples.
+
+def lifecycle_event(event_name, status_payload):
+    """Wrap a serviceEventDetails payload in the EventBridge envelope."""
+    return {
+        'source': 'aws.controltower',
+        'detail': {
+            'eventName': event_name,
+            'serviceEventDetails': status_payload,
+        },
+    }
+
+
+CREATE_MANAGED_ACCOUNT = lifecycle_event('CreateManagedAccount', {
+    'createManagedAccountStatus': {
+        'organizationalUnit': {'organizationalUnitName': 'Custom', 'organizationalUnitId': 'ou-1'},
+        'account': {'accountName': 'workload', 'accountId': '444455556666'},
+        'state': 'SUCCEEDED',
+    },
+})
+
+ENABLE_BASELINE = lifecycle_event('EnableBaseline', {
+    'enableBaselineStatus': {
+        'enabledBaselineDetails': {
+            'targetIdentifier': 'arn:aws:organizations::111122223333:account/o-abc123/444455556666',
+            'statusSummary': {'status': 'SUCCEEDED'},
+        },
+    },
+})
+
+RESET_ENABLED_BASELINE_ON_OU = lifecycle_event('ResetEnabledBaseline', {
+    'resetEnabledBaselineStatus': {
+        'enabledBaselineDetails': {
+            'targetIdentifier': 'arn:aws:organizations::111122223333:ou/o-abc123/ou-abc1-22223333',
+            'statusSummary': {'status': 'SUCCEEDED'},
+        },
+    },
+})
+
+REGISTER_ORGANIZATIONAL_UNIT = lifecycle_event('RegisterOrganizationalUnit', {
+    'registerOrganizationalUnitStatus': {
+        'state': 'SUCCEEDED',
+        'organizationalUnit': {'organizationalUnitName': 'Test', 'organizationalUnitId': 'ou-1'},
+    },
+})
+
+UPDATE_LANDING_ZONE = lifecycle_event('UpdateLandingZone', {
+    'updateLandingZoneStatus': {
+        'state': 'SUCCEEDED',
+        'rootOrganizationalId': 'r-1234',
+        # Note the plural: a list of accounts, not a single 'account' object.
+        'accounts': [
+            {'accountName': 'Audit', 'accountId': '444455556666'},
+            {'accountName': 'Log archive', 'accountId': '777788889999'},
+        ],
+    },
+})
+
+
+def test_managed_account_event_yields_its_account():
+    assert lifecycle_event_account(CREATE_MANAGED_ACCOUNT) == '444455556666'
+
+
+def test_baseline_event_account_is_parsed_from_the_target_arn():
+    assert lifecycle_event_account(ENABLE_BASELINE) == '444455556666'
+
+
+def test_baseline_event_on_an_ou_falls_back_to_all_accounts():
+    """An OU-level baseline has no single account, so the whole org is walked."""
+    assert lifecycle_event_account(RESET_ENABLED_BASELINE_ON_OU) == ''
+
+
+def test_ou_registration_falls_back_to_all_accounts():
+    assert lifecycle_event_account(REGISTER_ORGANIZATIONAL_UNIT) == ''
+
+
+def test_landing_zone_account_list_is_not_read_as_a_single_account():
+    """
+    The landing zone events carry 'accounts' as a list. Reading the first of them
+    as the target would update one account and skip the rest.
+    """
+    assert lifecycle_event_account(UPDATE_LANDING_ZONE) == ''
+
+
+def test_state_is_read_from_both_shapes():
+    assert lifecycle_event_state(CREATE_MANAGED_ACCOUNT) == 'SUCCEEDED'
+    assert lifecycle_event_state(REGISTER_ORGANIZATIONAL_UNIT) == 'SUCCEEDED'
+    # Nested under statusSummary on the baseline events, not 'state'.
+    assert lifecycle_event_state(ENABLE_BASELINE) == 'SUCCEEDED'
+
+
+def test_failed_state_is_reported_from_both_shapes():
+    failed_account = lifecycle_event('CreateManagedAccount', {
+        'createManagedAccountStatus': {'state': 'FAILED'},
+    })
+    failed_baseline = lifecycle_event('EnableBaseline', {
+        'enableBaselineStatus': {
+            'enabledBaselineDetails': {'statusSummary': {'status': 'FAILED'}},
+        },
+    })
+
+    assert lifecycle_event_state(failed_account) == 'FAILED'
+    assert lifecycle_event_state(failed_baseline) == 'FAILED'
+
+
+def test_unreadable_state_returns_none_rather_than_failing():
+    """
+    None means "process it anyway". Dropping an unrecognised shape would leave the
+    recorder reverted silently, which is the failure this function exists to stop.
+    """
+    assert lifecycle_event_state(lifecycle_event('SomethingNew', {'newStatus': {}})) is None
+    assert lifecycle_event_state({'source': 'aws.controltower', 'detail': {}}) is None
+
+
+def test_unknown_event_shape_still_yields_an_org_wide_walk():
+    assert lifecycle_event_account(lifecycle_event('SomethingNew', {'newStatus': {}})) == ''
+
+
+# --- lambda_handler dispatch --------------------------------------------------
+
+@pytest.fixture
+def captured_process(monkeypatch):
+    """Replace process_accounts and record the account scope it was called with."""
+    calls = []
+
+    def _fake(selection_mode, excluded, included, account, event_type):
+        calls.append({'account': account, 'event_type': event_type})
+        return {'updated': 1, 'failed': 0, 'failures': [], 'fatal': None}
+
+    monkeypatch.setattr(mod, 'process_accounts', _fake)
+    return calls
+
+
+def test_handler_skips_failed_lifecycle_events(captured_process):
+    """
+    A failed operation applied no baseline, so there is nothing to override.
+    Processing it anyway would assume a role in an account that may not exist yet,
+    failing the run and tripping the error alarm for no reason.
+    """
+    event = lifecycle_event('CreateManagedAccount', {
+        'createManagedAccountStatus': {
+            'account': {'accountId': '444455556666'},
+            'state': 'FAILED',
+        },
+    })
+
+    result = mod.lambda_handler(event, None)
+
+    assert captured_process == []
+    assert result['skipped'] == 'CreateManagedAccount'
+
+
+def test_handler_narrows_to_one_account_for_baseline_events(captured_process):
+    mod.lambda_handler(ENABLE_BASELINE, None)
+
+    assert captured_process == [{'account': '444455556666', 'event_type': 'controltower'}]
+
+
+def test_handler_walks_all_accounts_for_ou_registration(captured_process):
+    mod.lambda_handler(REGISTER_ORGANIZATIONAL_UNIT, None)
+
+    assert captured_process == [{'account': '', 'event_type': 'controltower'}]
+
+
+def test_handler_treats_a_schedule_or_manual_event_as_a_full_apply(captured_process):
+    """The reconciliation schedule sends exactly this payload."""
+    mod.lambda_handler({'action': 'apply'}, None)
+
+    assert captured_process == [{'account': '', 'event_type': 'apply'}]
+
+
+def test_handler_passes_the_delete_action_through(captured_process):
+    mod.lambda_handler({'action': 'Delete'}, None)
+
+    assert captured_process == [{'account': '', 'event_type': 'Delete'}]

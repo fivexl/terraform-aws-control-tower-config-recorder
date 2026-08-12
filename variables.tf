@@ -8,9 +8,35 @@
 # Control Tower calls home, because that is what decides where global resource
 # types (IAM and friends) are recorded.
 variable "control_tower_home_region" {
-  description = "Region where Control Tower is deployed. Global resource types are only recorded in this region. Defaults to the region of the calling provider, which is correct when the module is applied in the Control Tower home region."
+  description = "Region where Control Tower is deployed. Global resource types are recorded only in this region unless global_iam_recording_region overrides that. Defaults to the region of the calling provider, which is correct when the module is applied in the Control Tower home region."
   type        = string
   default     = null
+
+  # Syntax only. It cannot tell us-east-2 from a mistyped us-east-1, which is why
+  # the Lambda also asserts that this region is one Control Tower actually governs.
+  validation {
+    condition     = var.control_tower_home_region == null || can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", var.control_tower_home_region))
+    error_message = "Must look like an AWS region, for example us-east-1 or eu-central-2."
+  }
+}
+
+# AWS records the global IAM resource types in whichever single region you
+# nominate, and Control Tower's baseline nominates its home region. That breaks
+# down when the home region is one of the ten where AWS cannot record them at all,
+# hence this override. See the plan-time check in main.tf.
+variable "global_iam_recording_region" {
+  description = "Region that records the global IAM resource types (IAM users, groups, roles, customer managed policies). Defaults to control_tower_home_region, which is correct almost always. Set it to another governed region when Control Tower is homed in one of the regions where AWS cannot record global IAM types, or to an empty string to accept that no region records them."
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.global_iam_recording_region == null ||
+      var.global_iam_recording_region == "" ||
+      can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", var.global_iam_recording_region))
+    )
+    error_message = "Must look like an AWS region, for example us-east-1, or \"\" to record global IAM types nowhere."
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -28,15 +54,14 @@ variable "account_selection_mode" {
   }
 }
 
-# WARNING: The default below is a set of placeholder account IDs, not a safe
-# default. Those IDs match no real account, so leaving this unset in EXCLUSION
-# mode means the module rewrites the Config Recorder in EVERY managed account,
-# including Management, Log Archive, and Audit. Those three should normally keep
-# their Control Tower defaults. Always override this with your real account IDs.
+# There is no safe default here, because account IDs are specific to your
+# organization. The empty default therefore does not silently target everything:
+# EXCLUSION mode rejects an empty list at plan time (see the precondition in
+# main.tf), so the module cannot rewrite every managed account by accident.
 variable "excluded_accounts" {
-  description = "List of AWS account IDs to exclude. Should contain Management, Log Archive, and Audit accounts at minimum. Only used when account_selection_mode is EXCLUSION. The default is placeholder IDs and must be overridden - see the warning in the README."
+  description = "List of AWS account IDs to exclude. Should contain Log Archive and Audit accounts at minimum. Only used when account_selection_mode is EXCLUSION, where an empty list is rejected at plan time."
   type        = list(string)
-  default     = ["111111111111", "222222222222", "333333333333"]
+  default     = []
 }
 
 variable "included_accounts" {
@@ -72,20 +97,23 @@ variable "config_recorder_included_resource_types" {
   default     = "AWS::S3::Bucket,AWS::CloudTrail::Trail"
 }
 
+# NOTE: the two variables below keep "daily" in their names for compatibility.
+# They are the resource types that config_recorder_override_recording_frequency
+# applies to, which is DAILY by default but no longer has to be.
 variable "config_recorder_daily_resource_types" {
-  description = "Comma-separated list of resource types to record at daily cadence"
+  description = "Comma-separated list of resource types the override recording frequency applies to. AWS allows a single override, so this list and config_recorder_daily_global_resource_types share one frequency."
   type        = string
   default     = "AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"
 }
 
 variable "config_recorder_daily_global_resource_types" {
-  description = "Comma-separated list of global resource types to record daily in the Control Tower home region"
+  description = "Comma-separated list of global resource types the override recording frequency applies to. Only applied in the Control Tower home region, since that is the only region where global types are recorded."
   type        = string
   default     = "AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"
 }
 
 variable "config_recorder_default_recording_frequency" {
-  description = "Default frequency of recording configuration changes"
+  description = "Default frequency of recording configuration changes. Applies to every recorded resource type except those listed in the two override lists. AWS::Config::ResourceCompliance, AWS::Config::ConformancePackCompliance and AWS::Config::ConfigurationRecorder cannot be recorded daily and stay continuous regardless."
   type        = string
   default     = "CONTINUOUS"
 
@@ -95,12 +123,23 @@ variable "config_recorder_default_recording_frequency" {
   }
 }
 
+variable "config_recorder_override_recording_frequency" {
+  description = "Recording frequency applied to the resource types in config_recorder_daily_resource_types and config_recorder_daily_global_resource_types. Set this to CONTINUOUS with a DAILY default to keep specific types on continuous recording, which is what AWS Firewall Manager requires of the types its policies cover."
+  type        = string
+  default     = "DAILY"
+
+  validation {
+    condition     = contains(["CONTINUOUS", "DAILY"], var.config_recorder_override_recording_frequency)
+    error_message = "Must be CONTINUOUS or DAILY."
+  }
+}
+
 # -----------------------------------------------------------------------------
 # Lambda
 # -----------------------------------------------------------------------------
 
 variable "lambda_memory_size" {
-  description = "Memory in MB allocated to the Lambda function. Peak usage grows with the number of account-region pairs processed in one run."
+  description = "Memory in MB allocated to the Lambda function. The function holds one cached session per account and one settings dict per region, so memory is roughly flat in the number of accounts; this mainly buys CPU."
   type        = number
   default     = 1024
 }
@@ -163,6 +202,23 @@ variable "eventbridge_maximum_retry_attempts" {
   description = "Number of times EventBridge retries delivering a Control Tower event to the Lambda before discarding it."
   type        = number
   default     = 10
+}
+
+variable "reconciliation_schedule_expression" {
+  description = "EventBridge schedule for periodically re-applying Config Recorder settings, for example rate(12 hours) or cron(0 3 * * ? *). Control Tower keeps adding lifecycle events, and a missed one leaves the recorder reverted with nothing on the Errors metric to show it, so this bounds how long that can last. Re-applying is idempotent. Set to null or an empty string to disable and rely solely on lifecycle events."
+  type        = string
+  default     = "rate(12 hours)"
+
+  # Empty string disables as well as null, because `-var x=null` on the command
+  # line passes the literal string "null" rather than a null value.
+  validation {
+    condition = (
+      var.reconciliation_schedule_expression == null ||
+      var.reconciliation_schedule_expression == "" ||
+      can(regex("^(rate|cron)\\(", var.reconciliation_schedule_expression))
+    )
+    error_message = "Must be an EventBridge schedule expression starting with rate( or cron(, or null or \"\" to disable."
+  }
 }
 
 variable "eventbridge_maximum_event_age_in_seconds" {

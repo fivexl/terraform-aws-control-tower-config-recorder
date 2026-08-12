@@ -7,6 +7,33 @@ locals {
   # recorded. Falls back to the region this module is being applied in.
   control_tower_home_region = coalesce(var.control_tower_home_region, data.aws_region.current.region)
 
+  # The single region that records the global IAM types. Defaults to the home
+  # region, matching the Control Tower baseline. An empty string is a deliberate
+  # "nowhere", so this uses != null rather than coalesce.
+  global_iam_recording_region = (
+    var.global_iam_recording_region != null
+    ? var.global_iam_recording_region
+    : local.control_tower_home_region
+  )
+
+  # AWS can only record the global IAM resource types in regions where Config was
+  # available before February 2022. These ten came later, and Control Tower can be
+  # homed in some of them, so nominating one records nothing at all.
+  # https://docs.aws.amazon.com/config/latest/developerguide/select-resources.html
+  # Keep in step with that page as AWS adds regions.
+  regions_without_global_iam_recording = [
+    "ap-south-2",     # Asia Pacific (Hyderabad)
+    "ap-southeast-4", # Asia Pacific (Melbourne)
+    "ap-southeast-5", # Asia Pacific (Malaysia)
+    "ap-southeast-7", # Asia Pacific (Thailand)
+    "ca-west-1",      # Canada West (Calgary)
+    "eu-central-2",   # Europe (Zurich)
+    "eu-south-2",     # Europe (Spain)
+    "il-central-1",   # Israel (Tel Aviv)
+    "me-central-1",   # Middle East (UAE)
+    "mx-central-1",   # Mexico (Central)
+  ]
+
   # Account lists cross into the Lambda as JSON so the function can parse them
   # with json.loads rather than evaluating a Python literal.
   excluded_accounts_json = jsonencode(var.excluded_accounts)
@@ -19,6 +46,70 @@ locals {
   # instead of silently double-managing every account.
   function_name = "ct-config-recorder-override"
   rule_name     = "ct-config-recorder-override-trigger"
+
+  # Both null and "" disable the schedule. See the variable for why.
+  reconciliation_enabled = try(trimspace(var.reconciliation_schedule_expression), "") != ""
+}
+
+# -----------------------------------------------------------------------------
+# Configuration guards
+#
+# These are preconditions rather than variable validation blocks because each one
+# reads two variables at once, and cross-variable validation needs Terraform 1.9.
+# This module supports 1.5, so the checks live on a resource instead.
+#
+# Both failures they catch are silent at runtime: one rewrites accounts nobody
+# meant to touch, the other writes a recorder that records nothing. Plan time is
+# the right place to find out.
+# -----------------------------------------------------------------------------
+
+resource "terraform_data" "validate_configuration" {
+  # Re-planned whenever a guarded value changes, so the checks cannot be skipped
+  # by an unrelated no-op plan.
+  triggers_replace = [
+    var.account_selection_mode,
+    var.config_recorder_strategy,
+    length(var.excluded_accounts),
+    length(var.included_accounts),
+    var.config_recorder_included_resource_types,
+  ]
+
+  lifecycle {
+    precondition {
+      condition     = var.account_selection_mode != "EXCLUSION" || length(var.excluded_accounts) > 0
+      error_message = "excluded_accounts must not be empty in EXCLUSION mode. Every managed account except the one this module runs in would have its Config Recorder rewritten, including Log Archive and Audit, which should keep their Control Tower defaults. List the accounts to leave alone, or use account_selection_mode = \"INCLUSION\" to name the accounts to change instead."
+    }
+
+    precondition {
+      condition     = var.account_selection_mode != "INCLUSION" || length(var.included_accounts) > 0
+      error_message = "included_accounts must not be empty in INCLUSION mode, otherwise the function runs and updates nothing."
+    }
+
+    precondition {
+      condition     = var.config_recorder_strategy != "INCLUSION" || trimspace(var.config_recorder_included_resource_types) != ""
+      error_message = "config_recorder_included_resource_types must not be empty with config_recorder_strategy = \"INCLUSION\". That combination produces a Config Recorder that records nothing, disabling Config recording across every targeted account."
+    }
+
+  }
+}
+
+# Kept separate from the checks above because the region it validates can come from
+# data.aws_region, and anything reading that resolves only once the provider is
+# configured. The variable-only checks stay independent of it so they always fail at
+# plan time.
+resource "terraform_data" "validate_global_iam_region" {
+  triggers_replace = [local.global_iam_recording_region]
+
+  lifecycle {
+    # Without this, a landing zone homed in one of those regions would exclude the
+    # global IAM types in every other governed region while requesting them in the
+    # one region AWS refuses to record them. Nothing would record them, and nothing
+    # would say so.
+    precondition {
+      condition     = !contains(local.regions_without_global_iam_recording, local.global_iam_recording_region)
+      error_message = "AWS cannot record the global IAM resource types in ${local.global_iam_recording_region}, because AWS Config was added there after February 2022. Set global_iam_recording_region to a governed region that supports them, or to \"\" to accept that no region records them."
+    }
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -75,18 +166,30 @@ module "lambda" {
     CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST     = var.config_recorder_excluded_resource_types
     CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST     = var.config_recorder_included_resource_types
     CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY         = var.config_recorder_default_recording_frequency
+    CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY        = var.config_recorder_override_recording_frequency
+    GLOBAL_IAM_RECORDING_REGION                         = local.global_iam_recording_region
     CONTROL_TOWER_HOME_REGION                           = local.control_tower_home_region
   }
 
   attach_policy_json = true
   policy_json        = data.aws_iam_policy_document.lambda_policy.json
 
-  allowed_triggers = {
-    ControlTowerEvents = {
-      principal  = "events.amazonaws.com"
-      source_arn = aws_cloudwatch_event_rule.control_tower.arn
-    }
-  }
+  allowed_triggers = merge(
+    {
+      ControlTowerEvents = {
+        principal  = "events.amazonaws.com"
+        source_arn = aws_cloudwatch_event_rule.control_tower.arn
+      }
+    },
+    local.reconciliation_enabled ? {
+      ReconciliationSchedule = {
+        principal = "events.amazonaws.com"
+        # one() rather than [0] so this is safe to evaluate when the rule count
+        # is zero.
+        source_arn = one(aws_cloudwatch_event_rule.reconciliation[*].arn)
+      }
+    } : {},
+  )
 
   cloudwatch_logs_retention_in_days = var.cloudwatch_logs_retention_in_days
 
@@ -120,11 +223,40 @@ resource "aws_cloudwatch_event_rule" "control_tower" {
   name        = local.rule_name
   description = "Rule to trigger config recorder override lambda"
 
+  # Every operation that can redeploy AWSControlTowerBP-BASELINE-CONFIG belongs
+  # here, because that StackSet is what overwrites this customization. A missing
+  # event is invisible: the function never runs, nothing fails, and the Errors
+  # alarm stays quiet while the recorder sits reverted.
+  #
+  # detail-type matters. Lifecycle events are non-API service events, published as
+  # "AWS Service Event via CloudTrail". Control Tower API calls are published as
+  # "AWS API Call via CloudTrail" and would not match this rule.
   event_pattern = jsonencode({
     source      = ["aws.controltower"]
     detail-type = ["AWS Service Event via CloudTrail"]
     detail = {
-      eventName = ["UpdateLandingZone", "CreateManagedAccount", "UpdateManagedAccount", "ResetLandingZone"]
+      eventName = [
+        # Account factory: a new or re-enrolled account gets the baseline.
+        "CreateManagedAccount",
+        "UpdateManagedAccount",
+        # Landing zone update re-applies baselines across the organization.
+        "UpdateLandingZone",
+        # Not in the documented lifecycle event list, and ResetLandingZone is an
+        # API operation, which CloudTrail publishes under the other detail-type.
+        # Retained anyway: an unmatched name costs nothing, and removing it would
+        # be a bet against undocumented behaviour. A reset should reach us through
+        # the landing zone, OU and baseline events it triggers.
+        "ResetLandingZone",
+        # Extending governance to an OU enrolls its accounts and deploys the
+        # Config baseline to each one.
+        "RegisterOrganizationalUnit",
+        # Baseline operations redeploy the Config baseline directly. These were
+        # the gap: they are newer than the events above and can revert every
+        # targeted account.
+        "EnableBaseline",
+        "ResetEnabledBaseline",
+        "UpdateEnabledBaseline",
+      ]
     }
   })
 
@@ -142,6 +274,41 @@ resource "aws_cloudwatch_event_target" "lambda" {
     maximum_retry_attempts       = var.eventbridge_maximum_retry_attempts
     maximum_event_age_in_seconds = var.eventbridge_maximum_event_age_in_seconds
   }
+}
+
+# -----------------------------------------------------------------------------
+# Reconciliation schedule
+#
+# The event list above is a moving target: Control Tower has added lifecycle
+# events over time, and the baseline events were missing here until 4.0.0. A
+# missed event is silent, because the function simply never runs. Nothing fails,
+# so the Errors alarm cannot help, and an unchanged `terraform apply` will not
+# re-invoke either, since the apply-time trigger keys on the source code hash.
+#
+# This schedule bounds that exposure without needing to predict the event list.
+# put_configuration_recorder is idempotent, so re-applying the same settings is a
+# no-op beyond the API calls.
+# -----------------------------------------------------------------------------
+
+resource "aws_cloudwatch_event_rule" "reconciliation" {
+  count = local.reconciliation_enabled ? 1 : 0
+
+  name                = "${local.function_name}-reconciliation"
+  description         = "Periodically re-apply Config Recorder settings so a missed Control Tower event cannot leave them reverted indefinitely"
+  schedule_expression = var.reconciliation_schedule_expression
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_event_target" "reconciliation" {
+  count = local.reconciliation_enabled ? 1 : 0
+
+  rule = aws_cloudwatch_event_rule.reconciliation[0].name
+  arn  = module.lambda.lambda_function_arn
+
+  # Same event the apply-time invocation sends, which the function reads as its
+  # default action.
+  input = jsonencode({ action = "apply" })
 }
 
 # -----------------------------------------------------------------------------

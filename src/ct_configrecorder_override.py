@@ -4,10 +4,17 @@ AWS Config Recorder Override for Control Tower environments.
 This Lambda function customizes AWS Config Recorder settings across child accounts
 managed by AWS Control Tower. It is triggered by:
 
-1. EventBridge rules on Control Tower lifecycle events (CreateManagedAccount,
-   UpdateManagedAccount, UpdateLandingZone, ResetLandingZone)
-2. Direct invocation from Terraform (via local-exec on apply)
-3. Manual invocation for ad-hoc operations (e.g., resetting accounts with action=Delete)
+1. EventBridge rules on Control Tower lifecycle events. Any operation that can
+   redeploy AWSControlTowerBP-BASELINE-CONFIG has to be covered, because that
+   StackSet is what overwrites this customization: the account events
+   (CreateManagedAccount, UpdateManagedAccount), the landing zone events
+   (UpdateLandingZone), OU registration (RegisterOrganizationalUnit) and the
+   baseline events (EnableBaseline, ResetEnabledBaseline, UpdateEnabledBaseline).
+2. A periodic reconciliation schedule, so that an event AWS adds in future, or one
+   lost because CloudTrail logging was off, cannot leave the recorder reverted
+   indefinitely. A missed event produces no error, so nothing else would notice.
+3. Direct invocation from Terraform (via local-exec on apply)
+4. Manual invocation for ad-hoc operations (e.g., resetting accounts with action=Delete)
 
 The function iterates accounts from the AWSControlTowerBP-BASELINE-CONFIG StackSet,
 assumes the AWSControlTowerExecution role in each target account, and updates the
@@ -36,10 +43,19 @@ Environment Variables:
     CONFIG_RECORDER_STRATEGY: EXCLUSION or INCLUSION for resource types
     CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST: Comma-separated resource types to exclude
     CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST: Comma-separated resource types to include
-    CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST: Comma-separated resource types for daily recording
-    CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST: Global resource types for daily recording
+    CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST: Comma-separated resource types the
+        override frequency applies to
+    CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST: Global resource types the override
+        frequency applies to, in the global IAM recording region only
     CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY: CONTINUOUS or DAILY
-    CONTROL_TOWER_HOME_REGION: AWS region where Control Tower is deployed
+    CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY: CONTINUOUS or DAILY, applied to the two
+        override resource type lists above
+    GLOBAL_IAM_RECORDING_REGION: The single region that records the global IAM resource
+        types, normally the Control Tower home region. Empty means no region records them,
+        which is the only option when Control Tower is homed in a region where AWS cannot
+        record them.
+    CONTROL_TOWER_HOME_REGION: Where Control Tower is deployed. Used only to restore
+        Control Tower's own defaults on a Delete action.
     LOG_LEVEL: Logging level (default: INFO)
 """
 
@@ -66,8 +82,26 @@ DEFAULT_RECORDER_NAME = 'aws-controltower-BaselineConfigRecorder'
 EXECUTION_ROLE_NAME = 'AWSControlTowerExecution'
 STACK_SET_NAME = 'AWSControlTowerBP-BASELINE-CONFIG'
 
+# The bundle of global resource types that includeGlobalResourceTypes covers.
+# They describe the same global resources in every region, so AWS recommends
+# recording them once, in one region, to avoid duplicate configuration items and
+# API throttling. Under the EXCLUSION_BY_RESOURCE_TYPES strategy the
+# includeGlobalResourceTypes flag is ignored by AWS, so the only way to stop that
+# duplication is to name these types as exclusions. See build_recorder_config.
+GLOBAL_IAM_RESOURCE_TYPES = (
+    'AWS::IAM::User',
+    'AWS::IAM::Group',
+    'AWS::IAM::Role',
+    'AWS::IAM::Policy',
+)
+
 # Seconds to wait after an AssumeRole call to stay clear of STS request-rate limits.
 ASSUME_ROLE_THROTTLE_DELAY = 1
+
+# A lifecycle event marks the completion of a Control Tower operation and reports
+# whether it succeeded or failed. Only a success means a baseline was applied and
+# therefore needs overriding again.
+LIFECYCLE_SUCCESS_STATE = 'SUCCEEDED'
 
 # The AWS SDK logs raw HTTP request and response bodies at DEBUG level
 # (botocore.parsers logs 'Response body'). The AssumeRole response body contains
@@ -140,8 +174,9 @@ def build_recorder_config(aws_region):
     Parse Config Recorder settings from the environment once per invocation.
 
     Resource-type lists are normalised here so that per-account processing does
-    no further parsing. The home-region check is region-specific, so the daily
-    resource list is resolved per region rather than globally.
+    no further parsing. Two of the decisions depend on whether the target region is
+    the one nominated to record the global IAM types, so the result is resolved per
+    region rather than once globally.
 
     Args:
         aws_region (str): The region the settings will be applied to
@@ -151,32 +186,59 @@ def build_recorder_config(aws_region):
     """
     strategy = os.getenv('CONFIG_RECORDER_STRATEGY', 'EXCLUSION')
     frequency = os.getenv('CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY', 'CONTINUOUS')
+    override_frequency = os.getenv('CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY', 'DAILY')
+    global_iam_region = os.getenv('GLOBAL_IAM_RECORDING_REGION', '')
 
-    daily = _split_env_list('CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST')
-    daily_global = _split_env_list('CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST')
+    # The two environment variables still carry DAILY in their names for
+    # compatibility with earlier versions. They are simply the resource types
+    # that override_frequency applies to, which is no longer always daily.
+    override_types = _split_env_list('CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST')
+    override_global = _split_env_list('CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST')
     exclusion = _split_env_list('CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST')
     inclusion = _split_env_list('CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST')
 
-    is_home_region = os.getenv('CONTROL_TOWER_HOME_REGION') == aws_region
+    # The one region that records the global IAM types. Empty means no region
+    # records them, which is a legitimate choice when Control Tower is homed in a
+    # region where AWS cannot record them at all.
+    is_global_iam_region = bool(global_iam_region) and global_iam_region == aws_region
+
+    # Tracked separately, and used only by the Delete branch. That branch restores
+    # Control Tower's own defaults, and Control Tower records global types in its
+    # home region, which is not necessarily where we chose to record them.
+    is_home_region = os.getenv('CONTROL_TOWER_HOME_REGION', '') == aws_region
+
+    if strategy == 'EXCLUSION' and exclusion and not is_global_iam_region:
+        # AWS ignores includeGlobalResourceTypes under EXCLUSION_BY_RESOURCE_TYPES
+        # and records the global IAM types anyway, so sending the flag as False is
+        # not enough to keep them out. Naming them as exclusions is, and outside
+        # the nominated region they are duplicate recordings of the same global
+        # resources. IAM churns on every deploy, so leaving them on multiplies
+        # Config cost by the number of governed regions for no added coverage.
+        exclusion = exclusion + [t for t in GLOBAL_IAM_RESOURCE_TYPES if t not in exclusion]
+
+    if is_global_iam_region:
+        override_types = override_types + [
+            t for t in override_global if t not in override_types]
 
     if strategy == 'EXCLUSION':
-        # Recording an excluded type at daily cadence would be contradictory.
-        daily = [x for x in daily if x not in exclusion]
-
-    if is_home_region:
-        daily = daily + daily_global
-
-    if strategy != 'EXCLUSION':
-        # Anything recorded daily must also be in the inclusion list, otherwise
-        # the override refers to a type that is not being recorded at all.
-        inclusion = inclusion + [x for x in daily if x not in inclusion]
+        # Overriding the cadence of a type that is not being recorded at all is
+        # contradictory. Filtered after the global list is appended, so types
+        # named in both the exclusion list and the global override list are
+        # dropped rather than slipping past the filter.
+        override_types = [x for x in override_types if x not in exclusion]
+    else:
+        # Anything given a cadence override must also be in the inclusion list,
+        # otherwise the override refers to a type that is not being recorded.
+        inclusion = inclusion + [x for x in override_types if x not in inclusion]
 
     return {
         'strategy': strategy,
         'frequency': frequency,
-        'daily': daily,
+        'override_frequency': override_frequency,
+        'override_types': override_types,
         'exclusion': exclusion,
         'inclusion': inclusion,
+        'is_global_iam_region': is_global_iam_region,
         'is_home_region': is_home_region,
     }
 
@@ -193,8 +255,15 @@ def build_recorder_payload(recorder_name, role_arn_config, config, event_type):
 
     Returns:
         dict: ConfigurationRecorder payload
+
+    Raises:
+        ValueError: If the INCLUSION strategy is configured with no resource types
     """
     if event_type == 'Delete':
+        # Restores Control Tower's defaults, so this follows the home region rather
+        # than global_iam_recording_region. Control Tower records global types where
+        # it lives, and the point of this branch is to hand the recorder back in the
+        # state Control Tower expects.
         return {
             'name': recorder_name,
             'roleARN': role_arn_config,
@@ -210,15 +279,22 @@ def build_recorder_payload(recorder_name, role_arn_config, config, event_type):
         if config['exclusion']:
             payload['recordingGroup'] = {
                 'allSupported': False,
+                # Sent for completeness only. AWS ignores this field under
+                # EXCLUSION_BY_RESOURCE_TYPES, which is why build_recorder_config
+                # adds the global IAM types to the exclusion list itself outside
+                # the nominated region.
                 'includeGlobalResourceTypes': False,
                 'exclusionByResourceTypes': {'resourceTypes': config['exclusion']},
                 'recordingStrategy': {'useOnly': 'EXCLUSION_BY_RESOURCE_TYPES'},
             }
         else:
-            # Nothing to exclude means record everything.
+            # Nothing to exclude means record every supported type. The global IAM
+            # types are recorded in one region only, matching the Control Tower
+            # baseline: they describe the same global resources in every region, so
+            # recording them more than once adds cost without coverage.
             payload['recordingGroup'] = {
                 'allSupported': True,
-                'includeGlobalResourceTypes': True,
+                'includeGlobalResourceTypes': config['is_global_iam_region'],
             }
     elif config['inclusion']:
         payload['recordingGroup'] = {
@@ -228,24 +304,79 @@ def build_recorder_payload(recorder_name, role_arn_config, config, event_type):
             'recordingStrategy': {'useOnly': 'INCLUSION_BY_RESOURCE_TYPES'},
         }
     else:
-        payload['recordingGroup'] = {
-            'allSupported': False,
-            'includeGlobalResourceTypes': False,
-        }
+        # allSupported False with no resourceTypes is a recorder that records
+        # nothing. Silently switching Config off across an organization is worse
+        # than failing, so refuse. Terraform also rejects this at plan time; this
+        # guard covers a function invoked with hand-edited environment variables.
+        raise ValueError(
+            'INCLUSION strategy requires at least one resource type. Set '
+            'config_recorder_included_resource_types, or switch to the EXCLUSION '
+            'strategy. Refusing to write a Config Recorder that records nothing.')
 
-    if config['daily']:
-        payload['recordingMode'] = {
-            'recordingFrequency': config['frequency'],
-            'recordingModeOverrides': [
+    # Emitted whenever a cadence is configured, not only when there are override
+    # types. A DAILY default with no overrides is the natural way to say "record
+    # everything once every 24 hours", and omitting the block there left every
+    # recorder on continuous recording with no error and no log line.
+    if config['override_types'] or config['frequency'] != 'CONTINUOUS':
+        payload['recordingMode'] = {'recordingFrequency': config['frequency']}
+
+        if config['override_types']:
+            override_frequency = config['override_frequency']
+            # AWS caps recordingModeOverrides at a single object, so one override
+            # frequency plus one resource type list is the whole of what the API
+            # can express here.
+            payload['recordingMode']['recordingModeOverrides'] = [
                 {
-                    'description': 'DAILY_OVERRIDE',
-                    'resourceTypes': config['daily'],
-                    'recordingFrequency': 'DAILY',
+                    'description': f'{override_frequency}_OVERRIDE',
+                    'resourceTypes': config['override_types'],
+                    'recordingFrequency': override_frequency,
                 }
-            ],
-        }
+            ]
 
     return payload
+
+
+def check_global_iam_region(global_iam_region, regions_seen, single_account_run):
+    """
+    Return an error message when the region nominated to record global IAM types
+    was never among the regions actually processed.
+
+    GLOBAL_IAM_RECORDING_REGION is otherwise an unchecked string comparison. A
+    typo, or a region Control Tower does not govern, means no region matches, so
+    the global IAM types are excluded everywhere and nothing records them. That is
+    silent: every account updates successfully and the run reports success while
+    IAM configuration recording has stopped organization-wide. Returning an error
+    here makes it reach the Lambda Errors metric and the alarm.
+
+    Args:
+        global_iam_region (str): Region nominated to record the global IAM types
+        regions_seen (set): Regions found in the StackSet during this run
+        single_account_run (bool): True when the run targeted one account
+
+    Returns:
+        str|None: Error message, or None when there is nothing to report
+    """
+    if not global_iam_region:
+        # Deliberately recording global IAM types nowhere.
+        return None
+
+    if not regions_seen or global_iam_region in regions_seen:
+        # Nothing was processed, so there is nothing to conclude; or it matched.
+        return None
+
+    if single_account_run:
+        # One account need not have an instance in every governed region, so this
+        # is only conclusive across a full walk.
+        logger.warning(
+            f'Global IAM recording region {global_iam_region} was not among the regions '
+            f'processed for this account: {sorted(regions_seen)}')
+        return None
+
+    return (
+        f'Global IAM recording region {global_iam_region} was not found among the regions '
+        f'Control Tower governs: {sorted(regions_seen)}. Nothing is recording the global '
+        f'IAM resource types as a result. Check global_iam_recording_region and '
+        f'control_tower_home_region.')
 
 
 def should_process_account(account_id, selection_mode, excluded_accounts, included_accounts):
@@ -318,7 +449,7 @@ def update_config_recorder(session, account_id, aws_region, partition, config, e
 
     On 'Delete' events, resets the Config Recorder to Control Tower defaults
     (allSupported=True). Otherwise applies the configured recording strategy
-    with optional daily recording frequency overrides.
+    with optional per-resource-type recording frequency overrides.
 
     Args:
         session (boto3.Session): Session with credentials for the target account
@@ -385,9 +516,11 @@ def process_accounts(selection_mode, excluded_accounts, included_accounts, accou
         event_type (str): Passed through to update_config_recorder
 
     Returns:
-        dict: {'updated': int, 'failed': int, 'failures': list, 'fatal': str|None}
+        dict: {'updated': int, 'failed': int, 'failures': list, 'fatal': str|None,
+               'misconfigured': str|None}
     """
-    result = {'updated': 0, 'failed': 0, 'failures': [], 'fatal': None}
+    result = {
+        'updated': 0, 'failed': 0, 'failures': [], 'fatal': None, 'misconfigured': None}
 
     try:
         sts_client = boto3.client('sts')
@@ -401,6 +534,9 @@ def process_accounts(selection_mode, excluded_accounts, included_accounts, accou
         skipped_accounts = set()
         # Settings depend only on the region, so resolve each region once.
         config_cache = {}
+        # Every region the StackSet reported, used to confirm that the region
+        # nominated to record global IAM types is one Control Tower governs.
+        regions_seen = set()
 
         cloudformation = boto3.client('cloudformation')
         paginator = cloudformation.get_paginator('list_stack_instances')
@@ -413,6 +549,10 @@ def process_accounts(selection_mode, excluded_accounts, included_accounts, accou
             for item in page.get('Summaries', []):
                 account_id = item['Account']
                 region = item['Region']
+
+                # Recorded before any filtering, since this describes the regions
+                # Control Tower governs rather than the ones we chose to touch.
+                regions_seen.add(region)
 
                 if account_id in skipped_accounts:
                     continue
@@ -453,6 +593,9 @@ def process_accounts(selection_mode, excluded_accounts, included_accounts, accou
                     result['failed'] += 1
                     result['failures'].append(f'{account_id}/{region}: {e}')
                     # Continue processing other accounts and regions.
+
+        result['misconfigured'] = check_global_iam_region(
+            os.getenv('GLOBAL_IAM_RECORDING_REGION', ''), regions_seen, bool(account))
 
     except Exception as e:
         # A failure out here (bad StackSet name, missing permissions) means no
@@ -497,20 +640,119 @@ def parse_account_list(raw_value, label):
     return [str(item) for item in parsed]
 
 
-def lifecycle_event_account(event, status_key):
+def _lifecycle_status_payloads(event):
     """
-    Pull the account ID out of a Control Tower lifecycle event.
+    Yield the status objects nested under serviceEventDetails.
 
-    Create and Update events carry the same shape under different status keys.
+    Every Control Tower lifecycle event carries exactly one such object, named
+    after the originating operation (createManagedAccountStatus,
+    enableBaselineStatus, and so on).
+    """
+    details = event.get('detail', {}).get('serviceEventDetails') or {}
+    if not isinstance(details, dict):
+        return
+
+    for payload in details.values():
+        if isinstance(payload, dict):
+            yield payload
+
+
+def lifecycle_event_state(event):
+    """
+    Return the completion state of a Control Tower lifecycle event.
+
+    The field differs by event family: the account, OU and landing zone events
+    carry 'state', while the baseline events nest it at
+    enabledBaselineDetails.statusSummary.status.
+
+    Returns None when no state can be read, which the caller treats as "process
+    it anyway". Failing open is deliberate. Dropping an event whose shape we did
+    not recognise would leave the Config Recorder reverted with nothing on the
+    Errors metric to show it, which is the failure mode this whole function
+    exists to prevent.
 
     Args:
         event (dict): The EventBridge event
-        status_key (str): 'createManagedAccountStatus' or 'updateManagedAccountStatus'
 
     Returns:
-        str: The affected account ID
+        str|None: 'SUCCEEDED', 'FAILED', or None if not present
     """
-    return event['detail']['serviceEventDetails'][status_key]['account']['accountId']
+    for payload in _lifecycle_status_payloads(event):
+        if 'state' in payload:
+            return payload['state']
+
+        summary = (payload.get('enabledBaselineDetails') or {}).get('statusSummary') or {}
+        if 'status' in summary:
+            return summary['status']
+
+    return None
+
+
+def _account_from_target_identifier(target_identifier):
+    """
+    Pull the account ID out of a baseline event targetIdentifier ARN.
+
+    The target is either an account, for example
+    arn:aws:organizations::111122223333:account/o-abc123/444455556666, or an OU.
+    An OU target means the baseline was applied at OU level, so there is no single
+    account to narrow to and the caller walks the whole organization instead.
+
+    Args:
+        target_identifier (str): Organizations ARN of the baseline target
+
+    Returns:
+        str: Account ID, or '' when the target is not a single account
+    """
+    resource = target_identifier.rsplit(':', 1)[-1]
+    kind, _, path = resource.partition('/')
+
+    if kind == 'account' and path:
+        return path.rsplit('/', 1)[-1]
+
+    return ''
+
+
+def lifecycle_event_account(event):
+    """
+    Return the account a lifecycle event targets, or '' when it is organization-wide.
+
+    Three shapes are in play:
+
+        CreateManagedAccount, UpdateManagedAccount
+            account.accountId
+        EnableBaseline, ResetEnabledBaseline, UpdateEnabledBaseline
+            enabledBaselineDetails.targetIdentifier, an Organizations ARN
+        RegisterOrganizationalUnit, UpdateLandingZone, SetupLandingZone
+            no single account: an organizationalUnit, or an 'accounts' list
+
+    This reads whichever shape is present rather than switching on the event
+    name, so an event type AWS adds later still resolves without a code change.
+    That matters because the list has grown before: the baseline events are recent
+    additions, and missing them is what let a baseline redeploy silently revert
+    this customization.
+
+    '' is passed straight through to process_accounts, which then walks every
+    account in the StackSet. That is the right fallback for OU registration and
+    landing zone updates, which affect many accounts at once.
+
+    Args:
+        event (dict): The EventBridge event
+
+    Returns:
+        str: The affected account ID, or '' for organization-wide events
+    """
+    for payload in _lifecycle_status_payloads(event):
+        # 'account' is a single object. Note that the landing zone events instead
+        # carry 'accounts', a list, which correctly does not match here.
+        account = (payload.get('account') or {}).get('accountId')
+        if account:
+            return str(account)
+
+        target = (payload.get('enabledBaselineDetails') or {}).get('targetIdentifier')
+        if target:
+            return _account_from_target_identifier(target)
+
+    return ''
 
 
 def summarise_run(result):
@@ -524,7 +766,8 @@ def summarise_run(result):
         dict: Summary payload when every targeted account was updated
 
     Raises:
-        ConfigRecorderUpdateError: If the run aborted, or any account failed
+        ConfigRecorderUpdateError: If the run aborted, any account failed, or the
+            configuration was found to be wrong
     """
     updated = result['updated']
     failed = result['failed']
@@ -533,11 +776,22 @@ def summarise_run(result):
         logger.error(f'Run aborted before completion: {result["fatal"]}')
         raise ConfigRecorderUpdateError(result['fatal'])
 
+    # A misconfiguration and per-account failures are independent, so report both
+    # rather than letting whichever is checked first hide the other.
+    problems = []
+
+    if result.get('misconfigured'):
+        logger.error(result['misconfigured'])
+        problems.append(result['misconfigured'])
+
     if failed:
         detail = '; '.join(result['failures'])
         logger.error(f'Updated {updated} account-region pairs, {failed} failed: {detail}')
-        raise ConfigRecorderUpdateError(
+        problems.append(
             f'{failed} of {updated + failed} account-region pairs failed: {detail}')
+
+    if problems:
+        raise ConfigRecorderUpdateError(' | '.join(problems))
 
     logger.info(f'Execution successful. Updated {updated} account-region pairs.')
     return {'statusCode': 200, 'updated': updated, 'failed': 0}
@@ -565,30 +819,36 @@ def lambda_handler(event, context):
         if event_source:
             logger.info(f'Control Tower event {event_source}/{event_name}')
 
-        match (event_source, event_name):
-            case ('aws.controltower', 'UpdateManagedAccount'):
-                account = lifecycle_event_account(event, 'updateManagedAccountStatus')
-                logger.info(f'Overriding config recorder for SINGLE account: {account}')
-                result = process_accounts(
-                    selection_mode, excluded_accounts, included_accounts, account, 'controltower')
+        if event_source == 'aws.controltower':
+            state = lifecycle_event_state(event)
 
-            case ('aws.controltower', 'CreateManagedAccount'):
-                account = lifecycle_event_account(event, 'createManagedAccountStatus')
-                logger.info(f'Overriding config recorder for SINGLE account: {account}')
-                result = process_accounts(
-                    selection_mode, excluded_accounts, included_accounts, account, 'controltower')
+            if state is not None and state.upper() != LIFECYCLE_SUCCESS_STATE:
+                # A lifecycle event records the completion of an operation, so a
+                # failed one means the baseline was not applied and there is
+                # nothing to override. Acting on it would assume a role in an
+                # account that may not be provisioned, which would fail the run
+                # and trip the error alarm for no reason.
+                logger.warning(
+                    f'Ignoring {event_name} lifecycle event in state {state}')
+                return {'statusCode': 200, 'updated': 0, 'failed': 0, 'skipped': event_name}
 
-            case ('aws.controltower', 'UpdateLandingZone' | 'ResetLandingZone'):
-                logger.info(f'Overriding config recorder for ALL accounts due to {event_name} event')
-                result = process_accounts(
-                    selection_mode, excluded_accounts, included_accounts, '', 'controltower')
+            if state is None:
+                # Processed rather than dropped: see lifecycle_event_state.
+                logger.warning(f'No lifecycle state found on {event_name}, processing anyway')
 
-            case _:
-                # Direct invocation (e.g., from Terraform local-exec or manual trigger)
-                action = event.get('action', 'apply')
-                logger.info(f'Direct invocation with action: {action}')
-                result = process_accounts(
-                    selection_mode, excluded_accounts, included_accounts, '', action)
+            account = lifecycle_event_account(event)
+            scope = f'SINGLE account {account}' if account else 'ALL accounts'
+            logger.info(f'Overriding config recorder for {scope} due to {event_name}')
+            result = process_accounts(
+                selection_mode, excluded_accounts, included_accounts, account, 'controltower')
+
+        else:
+            # Direct invocation: Terraform local-exec, the reconciliation
+            # schedule, or a manual trigger such as {"action": "Delete"}.
+            action = event.get('action', 'apply')
+            logger.info(f'Direct invocation with action: {action}')
+            result = process_accounts(
+                selection_mode, excluded_accounts, included_accounts, '', action)
 
         return summarise_run(result)
 
