@@ -138,6 +138,12 @@ variable "config_recorder_override_recording_frequency" {
 # Lambda
 # -----------------------------------------------------------------------------
 
+variable "lambda_ignore_source_code_hash" {
+  description = "Passed straight through to terraform-aws-modules/lambda/aws. Set to true only as a workaround for the first apply in a fresh working directory needing to run twice, where the deployment archive does not exist yet when the module computes its source code hash. Leave false otherwise: true stops the function redeploying automatically when only its source changes."
+  type        = bool
+  default     = false
+}
+
 variable "lambda_memory_size" {
   description = "Memory in MB allocated to the Lambda function. The function holds one cached session per account and one settings dict per region, so memory is roughly flat in the number of accounts; this mainly buys CPU."
   type        = number

@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `config_recorder_daily_resource_types` and `config_recorder_daily_global_resource_types` keep their names for compatibility but are now documented as the resource types the override frequency applies to, which is daily only by default.
 - `lambda_memory_size` description no longer claims peak memory grows with the number of account-region pairs. The function holds one cached session per account and one settings dict per region, so memory is roughly flat; the setting mainly buys CPU.
 - The `Delete` action follows `control_tower_home_region` rather than `global_iam_recording_region`, since it restores Control Tower's own defaults and Control Tower records global types where it lives.
+- `pytest.ini` and `ruff.toml` are excluded from the deployed Lambda package. Dev tooling config, not needed at runtime, and previously shipped in the artifact alongside the handler.
+- `lambda_ignore_source_code_hash` variable, passed through to `terraform-aws-modules/lambda/aws`. Works around the first `apply` in a fresh working directory sometimes needing to run twice, because the module computes the function's source code hash from the packaged archive, which does not exist yet on that first run. Upstream module behavior, not specific to this module. Defaults to `false`, since setting it `true` also stops the function redeploying when only its source changes; documented in the README instead.
 - `pytest.ini` puts `tests` on `pythonpath` so shared test constants can be imported from `conftest`.
 
 ## [3.0.0] - 2026-07-22
