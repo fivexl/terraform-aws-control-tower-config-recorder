@@ -37,11 +37,46 @@ Resources are created in whichever region your provider targets, following Terra
 
 `control_tower_home_region` is a separate concern: it tells the function which region records global resource types (IAM and similar). It defaults to the provider's region, which is correct for the normal case. Only set it explicitly if you are deliberately applying the module outside the Control Tower home region.
 
+### Global resource types
+
+The global IAM types — IAM users, groups, roles and customer managed policies — describe the same resources in every region. Recording them in more than one region duplicates the data and the cost, and IAM churns on every deploy, so the duplication is not cheap. Control Tower's own baseline records them in the home region only, and this module matches that.
+
+Two AWS behaviours make that harder than it looks, and the module handles both:
+
+- `includeGlobalResourceTypes` only works alongside `allSupported`. Under the `EXCLUSION_BY_RESOURCE_TYPES` strategy [AWS ignores the flag](https://docs.aws.amazon.com/config/latest/APIReference/API_RecordingGroup.html) and records the global IAM types anyway. The module therefore adds those four types to the exclusion list itself in every region except the home region. If your exclusion list is empty the module uses `allSupported` instead, where the flag does work.
+- `AWS::RDS::GlobalCluster` is recorded in every region where the recorder is enabled regardless of `includeGlobalResourceTypes`, because the flag covers only the four IAM types. Add it to `config_recorder_excluded_resource_types` if you do not want it recorded more than once.
+
+### Recording frequency
+
+`config_recorder_default_recording_frequency` sets the cadence for everything recorded. `config_recorder_override_recording_frequency` sets the cadence for the types named in `config_recorder_daily_resource_types` and `config_recorder_daily_global_resource_types`. AWS allows [exactly one override object](https://docs.aws.amazon.com/config/latest/APIReference/API_RecordingMode.html), so those two lists share a single frequency.
+
+That is what makes the inverse arrangement possible: a `DAILY` default with `CONTINUOUS` for a few named types. AWS Firewall Manager depends on continuous recording for the types its policies cover, so if you use FMS and want daily recording for cost reasons, put those types in the override list and set the override frequency to `CONTINUOUS`.
+
+```hcl
+config_recorder_default_recording_frequency  = "DAILY"
+config_recorder_override_recording_frequency = "CONTINUOUS"
+# FMS DNS Firewall policies key on VPCs.
+config_recorder_daily_resource_types         = "AWS::EC2::VPC"
+config_recorder_daily_global_resource_types  = ""
+```
+
+Three resource types cannot be recorded daily and stay continuous whatever you configure:
+
+- `AWS::Config::ResourceCompliance`
+- `AWS::Config::ConformancePackCompliance`
+- `AWS::Config::ConfigurationRecorder`
+
+Under the `allSupported` strategy AWS sets them to continuous for you, so they are an unavoidable exception to any "everything daily" configuration.
+
 ### Scaling
 
 The Lambda walks account-region pairs sequentially. Credentials are cached per account, so an account spanning three regions costs one `AssumeRole` call rather than three, and the one-second throttle delay is paid per account rather than per region.
 
-For a rough sense of scale: each `AssumeRole` costs about a second, and each account-region pair costs one or two Config API calls on top. Within the 15-minute timeout that comfortably covers organizations in the low tens of accounts across a handful of regions. If you outgrow it, the [`original-arch-no-copy-lambda`](https://github.com/fivexl/terraform-aws-control-tower-config-recorder/tree/original-arch-no-copy-lambda) branch uses a fan-out pattern with parallel invocations.
+Runtime is roughly `accounts × 1s` for the `AssumeRole` throttle delay, plus two Config API calls per account-region pair (one `DescribeConfigurationRecorders`, one `PutConfigurationRecorder`). An organization of 52 accounts across 4 regions is about 52 seconds of throttle delay plus 416 API calls, which sits comfortably inside the 15-minute timeout. The timeout is unlikely to be your first constraint.
+
+`reserved_concurrent_executions` is 1, because overlapping runs would race each other writing the same recorders. That means Control Tower lifecycle events arriving together are processed one run at a time, so `eventbridge_maximum_event_age_in_seconds` matters more than the function timeout during a landing zone reset. If you outgrow the single sequential walk, the [`original-arch-no-copy-lambda`](https://github.com/fivexl/terraform-aws-control-tower-config-recorder/tree/original-arch-no-copy-lambda) branch uses a fan-out pattern with parallel invocations.
+
+`lambda_memory_size` is not a function of organization size: the function holds one cached session per account and one settings dict per region, so memory stays roughly flat. Raise it to buy CPU, not headroom.
 
 ### Failure handling
 
@@ -60,17 +95,19 @@ Set `create_error_alarm = false` if you monitor Lambda errors through some other
 - Credentials for the Control Tower **management account**. The function calls `ListStackInstances` without `CallAs`, so running from a delegated administrator account is not supported.
 - AWS CLI on the machine running Terraform, if `invoke_on_apply` is left enabled (the default). Set `invoke_on_apply = false` to remove that dependency and rely solely on Control Tower lifecycle events.
 
-## Important: `excluded_accounts` must be overridden
+## Account targeting is checked at plan time
 
-The default value of `excluded_accounts` is a set of **placeholder** account IDs:
+There is no safe default for `excluded_accounts`, because account IDs are specific to your organization. Rather than ship placeholder IDs that quietly match nothing, the module defaults to an empty list and refuses to plan in `EXCLUSION` mode until you fill it in:
 
-```hcl
-default = ["111111111111", "222222222222", "333333333333"]
+```
+excluded_accounts must not be empty in EXCLUSION mode. Every managed account
+except the one this module runs in would have its Config Recorder rewritten,
+including Log Archive and Audit, which should keep their Control Tower defaults.
 ```
 
-Those IDs match no real account. In `EXCLUSION` mode, leaving the default in place means the module rewrites the Config Recorder in **every** managed account, including Management, Log Archive, and Audit. Those three have special roles in Control Tower governance and should normally keep their default Config Recorder settings.
+List the accounts you want left alone — Log Archive and Audit at minimum — or use `INCLUSION` mode and name the accounts you want changed. `INCLUSION` mode applies the same reasoning in reverse and rejects an empty `included_accounts`, since the function would otherwise run and update nothing.
 
-Always set this to your real account IDs. If you would rather start conservatively, use `INCLUSION` mode and name only the accounts you want to change.
+The account the module runs in is always skipped, so the management account is never rewritten regardless of these lists.
 
 ## Usage
 
@@ -84,18 +121,20 @@ provider "aws" {
 
 module "config_recorder_override" {
   source  = "fivexl/control-tower-config-recorder/aws"
-  version = "~> 3.0"
+  version = "~> 4.0"
 
   account_selection_mode = "EXCLUSION"
 
-  # Your real Management, Log Archive, and Audit account IDs.
-  excluded_accounts = ["111111111111", "222222222222", "333333333333"]
+  # Required in EXCLUSION mode. Your real Log Archive and Audit account IDs,
+  # plus anything else that should keep its Control Tower defaults.
+  excluded_accounts = ["222222222222", "333333333333"]
 
-  config_recorder_strategy                    = "EXCLUSION"
-  config_recorder_excluded_resource_types     = "AWS::HealthLake::FHIRDatastore,AWS::Pinpoint::Segment,AWS::Pinpoint::ApplicationSettings"
-  config_recorder_default_recording_frequency = "CONTINUOUS"
-  config_recorder_daily_resource_types        = "AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"
-  config_recorder_daily_global_resource_types = "AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"
+  config_recorder_strategy                     = "EXCLUSION"
+  config_recorder_excluded_resource_types      = "AWS::HealthLake::FHIRDatastore,AWS::Pinpoint::Segment,AWS::Pinpoint::ApplicationSettings"
+  config_recorder_default_recording_frequency  = "CONTINUOUS"
+  config_recorder_override_recording_frequency = "DAILY"
+  config_recorder_daily_resource_types         = "AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"
+  config_recorder_daily_global_resource_types  = "AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"
 
   # Get told when an account fails to update.
   alarm_actions = [aws_sns_topic.alerts.arn]
@@ -112,6 +151,25 @@ output "lambda_function_arn" {
 ```
 
 See [`examples/basic`](examples/basic) and [`examples/inclusion-mode`](examples/inclusion-mode) for complete configurations.
+
+### Upgrading from 3.x
+
+`excluded_accounts` no longer defaults to placeholder IDs, so `EXCLUSION` mode now fails at plan time until you list your real accounts. If you were relying on the placeholders, you were rewriting every managed account; set the variable explicitly.
+
+Two behaviour changes apply themselves on the next run, with no configuration needed:
+
+- Global IAM types are no longer recorded outside the Control Tower home region. If you were on the `EXCLUSION` strategy, this reduces what is recorded in your non-home governed regions and should reduce your Config bill. Add the four IAM types to `config_recorder_daily_global_resource_types` only if you want them recorded at the override cadence in the home region.
+- `config_recorder_default_recording_frequency` is now honoured with empty override lists. If you set `DAILY` and kept a resource type in `config_recorder_daily_resource_types` purely to make the block appear, you can drop it.
+
+```diff
+ module "config_recorder_override" {
+-  version = "~> 3.0"
++  version = "~> 4.0"
+
++  # Now required in EXCLUSION mode.
++  excluded_accounts = ["222222222222", "333333333333"]
+ }
+```
 
 ### Upgrading from 2.x
 
@@ -162,6 +220,7 @@ Resource addresses also changed in 2.0.0 when the Lambda moved into `terraform-a
 | [aws_cloudwatch_event_target.lambda](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_target) | resource |
 | [aws_cloudwatch_metric_alarm.lambda_errors](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
 | [terraform_data.invoke_lambda](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
+| [terraform_data.validate_configuration](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
 | [aws_iam_policy_document.lambda_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
 | [aws_partition.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/partition) | data source |
 | [aws_region.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/region) | data source |
@@ -173,22 +232,23 @@ Resource addresses also changed in 2.0.0 when the Lambda moved into `terraform-a
 | <a name="input_account_selection_mode"></a> [account\_selection\_mode](#input\_account\_selection\_mode) | Account selection mode - EXCLUSION (processes all accounts except those in excluded\_accounts) or INCLUSION (processes only accounts in included\_accounts) | `string` | `"EXCLUSION"` | no |
 | <a name="input_alarm_actions"></a> [alarm\_actions](#input\_alarm\_actions) | List of ARNs (for example an SNS topic) to notify when the error alarm fires. An alarm with no actions still records state but notifies nobody. | `list(string)` | `[]` | no |
 | <a name="input_cloudwatch_logs_retention_in_days"></a> [cloudwatch\_logs\_retention\_in\_days](#input\_cloudwatch\_logs\_retention\_in\_days) | Number of days to retain Lambda CloudWatch log events | `number` | `14` | no |
-| <a name="input_config_recorder_daily_global_resource_types"></a> [config\_recorder\_daily\_global\_resource\_types](#input\_config\_recorder\_daily\_global\_resource\_types) | Comma-separated list of global resource types to record daily in the Control Tower home region | `string` | `"AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"` | no |
-| <a name="input_config_recorder_daily_resource_types"></a> [config\_recorder\_daily\_resource\_types](#input\_config\_recorder\_daily\_resource\_types) | Comma-separated list of resource types to record at daily cadence | `string` | `"AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"` | no |
-| <a name="input_config_recorder_default_recording_frequency"></a> [config\_recorder\_default\_recording\_frequency](#input\_config\_recorder\_default\_recording\_frequency) | Default frequency of recording configuration changes | `string` | `"CONTINUOUS"` | no |
+| <a name="input_config_recorder_daily_global_resource_types"></a> [config\_recorder\_daily\_global\_resource\_types](#input\_config\_recorder\_daily\_global\_resource\_types) | Comma-separated list of global resource types the override recording frequency applies to. Only applied in the Control Tower home region, since that is the only region where global types are recorded. | `string` | `"AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"` | no |
+| <a name="input_config_recorder_daily_resource_types"></a> [config\_recorder\_daily\_resource\_types](#input\_config\_recorder\_daily\_resource\_types) | Comma-separated list of resource types the override recording frequency applies to. AWS allows a single override, so this list and config\_recorder\_daily\_global\_resource\_types share one frequency. | `string` | `"AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"` | no |
+| <a name="input_config_recorder_default_recording_frequency"></a> [config\_recorder\_default\_recording\_frequency](#input\_config\_recorder\_default\_recording\_frequency) | Default frequency of recording configuration changes. Applies to every recorded resource type except those listed in the two override lists. AWS::Config::ResourceCompliance, AWS::Config::ConformancePackCompliance and AWS::Config::ConfigurationRecorder cannot be recorded daily and stay continuous regardless. | `string` | `"CONTINUOUS"` | no |
 | <a name="input_config_recorder_excluded_resource_types"></a> [config\_recorder\_excluded\_resource\_types](#input\_config\_recorder\_excluded\_resource\_types) | Comma-separated list of resource types to exclude from Config Recorder (used with EXCLUSION strategy) | `string` | `"AWS::HealthLake::FHIRDatastore,AWS::Pinpoint::Segment,AWS::Pinpoint::ApplicationSettings"` | no |
 | <a name="input_config_recorder_included_resource_types"></a> [config\_recorder\_included\_resource\_types](#input\_config\_recorder\_included\_resource\_types) | Comma-separated list of resource types to include in Config Recorder (used with INCLUSION strategy) | `string` | `"AWS::S3::Bucket,AWS::CloudTrail::Trail"` | no |
+| <a name="input_config_recorder_override_recording_frequency"></a> [config\_recorder\_override\_recording\_frequency](#input\_config\_recorder\_override\_recording\_frequency) | Recording frequency applied to the resource types in config\_recorder\_daily\_resource\_types and config\_recorder\_daily\_global\_resource\_types. Set this to CONTINUOUS with a DAILY default to keep specific types on continuous recording, which is what AWS Firewall Manager requires of the types its policies cover. | `string` | `"DAILY"` | no |
 | <a name="input_config_recorder_strategy"></a> [config\_recorder\_strategy](#input\_config\_recorder\_strategy) | Config Recorder strategy - EXCLUSION or INCLUSION | `string` | `"EXCLUSION"` | no |
 | <a name="input_control_tower_home_region"></a> [control\_tower\_home\_region](#input\_control\_tower\_home\_region) | Region where Control Tower is deployed. Global resource types are only recorded in this region. Defaults to the region of the calling provider, which is correct when the module is applied in the Control Tower home region. | `string` | `null` | no |
 | <a name="input_create_error_alarm"></a> [create\_error\_alarm](#input\_create\_error\_alarm) | Create a CloudWatch alarm on the Lambda Errors metric. The function raises on any per-account failure, so this alarm fires when one or more accounts could not be updated. | `bool` | `true` | no |
 | <a name="input_eventbridge_maximum_event_age_in_seconds"></a> [eventbridge\_maximum\_event\_age\_in\_seconds](#input\_eventbridge\_maximum\_event\_age\_in\_seconds) | Maximum age of a Control Tower event EventBridge will still attempt to deliver (60-86400). | `number` | `3600` | no |
 | <a name="input_eventbridge_maximum_retry_attempts"></a> [eventbridge\_maximum\_retry\_attempts](#input\_eventbridge\_maximum\_retry\_attempts) | Number of times EventBridge retries delivering a Control Tower event to the Lambda before discarding it. | `number` | `10` | no |
-| <a name="input_excluded_accounts"></a> [excluded\_accounts](#input\_excluded\_accounts) | List of AWS account IDs to exclude. Should contain Management, Log Archive, and Audit accounts at minimum. Only used when account\_selection\_mode is EXCLUSION. The default is placeholder IDs and must be overridden - see the warning in the README. | `list(string)` | <pre>[<br/>  "111111111111",<br/>  "222222222222",<br/>  "333333333333"<br/>]</pre> | no |
+| <a name="input_excluded_accounts"></a> [excluded\_accounts](#input\_excluded\_accounts) | List of AWS account IDs to exclude. Should contain Log Archive and Audit accounts at minimum. Only used when account\_selection\_mode is EXCLUSION, where an empty list is rejected at plan time. | `list(string)` | `[]` | no |
 | <a name="input_included_accounts"></a> [included\_accounts](#input\_included\_accounts) | List of AWS account IDs to include. Only used when account\_selection\_mode is INCLUSION. | `list(string)` | `[]` | no |
 | <a name="input_invoke_on_apply"></a> [invoke\_on\_apply](#input\_invoke\_on\_apply) | Invoke the Lambda on every terraform apply where the function code or configuration changed. Requires the AWS CLI on the machine running Terraform. Set to false to rely solely on Control Tower lifecycle events. | `bool` | `true` | no |
 | <a name="input_lambda_maximum_event_age_in_seconds"></a> [lambda\_maximum\_event\_age\_in\_seconds](#input\_lambda\_maximum\_event\_age\_in\_seconds) | Maximum age of an asynchronous invocation request Lambda will still process (60-21600). | `number` | `3600` | no |
 | <a name="input_lambda_maximum_retry_attempts"></a> [lambda\_maximum\_retry\_attempts](#input\_lambda\_maximum\_retry\_attempts) | Number of times Lambda retries a failed asynchronous invocation (0-2). Updating the Config Recorder is idempotent, so retrying is safe. | `number` | `2` | no |
-| <a name="input_lambda_memory_size"></a> [lambda\_memory\_size](#input\_lambda\_memory\_size) | Memory in MB allocated to the Lambda function. Peak usage grows with the number of account-region pairs processed in one run. | `number` | `1024` | no |
+| <a name="input_lambda_memory_size"></a> [lambda\_memory\_size](#input\_lambda\_memory\_size) | Memory in MB allocated to the Lambda function. The function holds one cached session per account and one settings dict per region, so memory is roughly flat in the number of accounts; this mainly buys CPU. | `number` | `1024` | no |
 | <a name="input_log_level"></a> [log\_level](#input\_log\_level) | Log level for the Lambda function. DEBUG is safe to enable: the AWS SDK loggers are pinned above DEBUG so temporary credentials are never written to CloudWatch Logs. | `string` | `"INFO"` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | A map of tags to add to all resources created by this module | `map(string)` | `{}` | no |
 
@@ -208,20 +268,19 @@ Resource addresses also changed in 2.0.0 when the Lambda moved into `terraform-a
 
 ### EXCLUSION Mode (Default)
 
-Applies Config Recorder changes to all Control Tower managed accounts except those in `excluded_accounts`. Include your Management, Log Archive, and Audit accounts at minimum.
+Applies Config Recorder changes to all Control Tower managed accounts except those in `excluded_accounts`. The list must be non-empty, which is checked at plan time.
 
 ### INCLUSION Mode
 
-Applies changes only to accounts listed in `included_accounts`. Useful for testing or targeting specific workload accounts.
+Applies changes only to accounts listed in `included_accounts`. Useful for testing or targeting specific workload accounts. The list must be non-empty, which is checked at plan time.
 
 ### Important Warning
 
 Regardless of mode, you should typically NOT customize the following accounts:
-- **Management Account** — Control Tower management account
 - **Log Archive Account** — centralized logging
 - **Audit Account** — security audit
 
-These have special roles in Control Tower governance and should maintain default Config Recorder settings.
+These have special roles in Control Tower governance and should maintain default Config Recorder settings. The **management account** needs no entry in either list: the function skips whichever account it runs in.
 
 ## File Structure
 

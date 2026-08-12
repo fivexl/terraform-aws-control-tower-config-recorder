@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-08-12
+
+### Fixed
+- **Global IAM resource types are no longer recorded outside the Control Tower home region.** Two separate paths got this wrong. With an empty `config_recorder_excluded_resource_types`, `includeGlobalResourceTypes` was hardcoded to `true`, switching global IAM recording on in every governed region; it now follows the home region like the `Delete` branch always did. Under the `EXCLUSION_BY_RESOURCE_TYPES` strategy the flag is [ignored by AWS](https://docs.aws.amazon.com/config/latest/APIReference/API_RecordingGroup.html) altogether, so sending it as `false` did nothing and the default configuration was recording IAM users, groups, roles and customer managed policies in every governed region. The four types are now added to the exclusion list itself outside the home region. IAM is global and churns on every deploy, so for an organization with N accounts across R regions this was (R-1)×N accounts recording duplicate data at full cost.
+- **`config_recorder_default_recording_frequency` is now honoured when the override lists are empty.** `recordingMode` was only emitted when there was at least one override type, so `DAILY` with empty lists — the natural way to say "record everything once every 24 hours" — sent nothing and left every recorder on continuous recording, with no error and no log line. The block is now emitted whenever a non-default frequency is configured, and `recordingModeOverrides` only when there are types to override.
+- **`config_recorder_daily_global_resource_types` no longer bypasses the exclusion filter.** The global list was appended after the filter ran, so a type named in both it and `config_recorder_excluded_resource_types` produced a cadence override for a type that was not being recorded at all. Duplicate entries across the two override lists are also collapsed now.
+
+### Added
+- `config_recorder_override_recording_frequency` variable (default `DAILY`), the recording frequency applied to the two override resource type lists. This makes the inverse arrangement expressible for the first time: a `DAILY` default with `CONTINUOUS` for a few named types. AWS Firewall Manager [depends on continuous recording](https://docs.aws.amazon.com/config/latest/APIReference/API_RecordingMode.html) for the types its policies cover, so an FMS user who wants daily recording for cost reasons previously had no way to exempt them. AWS caps `recordingModeOverrides` at one object, so a single frequency plus one type list is the whole of what the API can express.
+- Plan-time preconditions for three configurations that previously failed silently at runtime: an empty `excluded_accounts` in `EXCLUSION` mode, an empty `included_accounts` in `INCLUSION` mode, and an empty `config_recorder_included_resource_types` with the `INCLUSION` strategy. These are preconditions on a `terraform_data` resource rather than variable `validation` blocks because each reads two variables at once, and cross-variable validation needs Terraform 1.9 while this module supports 1.5.
+- The function now raises rather than writing a Config Recorder with `allSupported` false and no resource types, which records nothing. Terraform catches this at plan time; the runtime guard covers a function invoked with hand-edited environment variables.
+- Tests for every branch above, and the payload tests are now parametrised over home and non-home region. Previously every payload test ran in the home region, which is what let the global resource type defect stay invisible.
+- README sections on global resource types (including `AWS::RDS::GlobalCluster`, which is recorded in every enabled region regardless of `includeGlobalResourceTypes`), recording frequency, the three types AWS will not record daily, and a concrete scaling formula.
+
+### Changed
+- **BREAKING**: `excluded_accounts` now defaults to `[]` instead of `["111111111111", "222222222222", "333333333333"]`, and `EXCLUSION` mode rejects an empty list at plan time. The placeholder IDs matched no real account, so an unconfigured module rewrote the Config Recorder in every managed account. A dangerous default plus a prose warning in the README was weaker than a default that cannot misfire.
+- `config_recorder_daily_resource_types` and `config_recorder_daily_global_resource_types` keep their names for compatibility but are now documented as the resource types the override frequency applies to, which is daily only by default.
+- `lambda_memory_size` description no longer claims peak memory grows with the number of account-region pairs. The function holds one cached session per account and one settings dict per region, so memory is roughly flat; the setting mainly buys CPU.
+- `pytest.ini` puts `tests` on `pythonpath` so shared test constants can be imported from `conftest`.
+
 ## [3.0.0] - 2026-07-22
 
 ### Changed

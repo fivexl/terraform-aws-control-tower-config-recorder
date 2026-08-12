@@ -3,6 +3,7 @@
 import logging
 
 import pytest
+from conftest import HOME_REGION, OTHER_REGION
 
 import ct_configrecorder_override as mod
 from ct_configrecorder_override import (
@@ -191,47 +192,148 @@ def test_summarise_run_succeeds_when_nothing_matched():
 
 # --- build_recorder_config ---------------------------------------------------
 
-def test_exclusion_strategy_drops_daily_types_that_are_excluded(recorder_env):
+def test_exclusion_strategy_drops_override_types_that_are_excluded(recorder_env):
     recorder_env(
         CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::EC2::Volume,AWS::S3::Bucket',
         CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
     )
-    assert build_recorder_config('eu-west-1')['daily'] == ['AWS::S3::Bucket']
+    assert build_recorder_config(OTHER_REGION)['override_types'] == ['AWS::S3::Bucket']
 
 
-def test_global_daily_types_added_only_in_home_region(recorder_env):
+def test_global_override_types_added_only_in_home_region(recorder_env):
     recorder_env(CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST='AWS::IAM::Role')
 
-    assert build_recorder_config('us-east-1')['daily'] == ['AWS::IAM::Role']
-    assert build_recorder_config('eu-west-1')['daily'] == []
+    assert build_recorder_config(HOME_REGION)['override_types'] == ['AWS::IAM::Role']
+    assert build_recorder_config(OTHER_REGION)['override_types'] == []
 
 
-def test_inclusion_strategy_adds_daily_types_to_inclusion_list(recorder_env):
+def test_global_override_types_are_filtered_by_the_exclusion_list(recorder_env):
+    """
+    A type named in both lists was previously appended after the exclusion filter
+    ran, producing a cadence override for a type that is not recorded at all.
+    """
+    recorder_env(
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::IAM::Role',
+        CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST='AWS::IAM::Role',
+    )
+    assert build_recorder_config(HOME_REGION)['override_types'] == []
+
+
+def test_override_types_are_not_duplicated_across_the_two_lists(recorder_env):
+    recorder_env(
+        CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::IAM::Role',
+        CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST='AWS::IAM::Role',
+    )
+    assert build_recorder_config(HOME_REGION)['override_types'] == ['AWS::IAM::Role']
+
+
+def test_override_frequency_is_read_from_the_environment(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY='CONTINUOUS')
+    assert build_recorder_config(HOME_REGION)['override_frequency'] == 'CONTINUOUS'
+
+
+def test_inclusion_strategy_adds_override_types_to_inclusion_list(recorder_env):
     recorder_env(
         CONFIG_RECORDER_STRATEGY='INCLUSION',
         CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST='AWS::S3::Bucket',
         CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::EC2::Volume',
     )
-    assert build_recorder_config('eu-west-1')['inclusion'] == [
+    assert build_recorder_config(OTHER_REGION)['inclusion'] == [
         'AWS::S3::Bucket', 'AWS::EC2::Volume']
+
+
+# --- global IAM resource types ------------------------------------------------
+#
+# includeGlobalResourceTypes is ignored under EXCLUSION_BY_RESOURCE_TYPES, so the
+# only way to stop the global IAM types being recorded in every governed region is
+# to name them as exclusions outside the home region.
+
+def test_global_iam_types_are_excluded_outside_the_home_region(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
+
+    exclusion = build_recorder_config(OTHER_REGION)['exclusion']
+
+    assert exclusion[0] == 'AWS::EC2::Volume'
+    assert set(mod.GLOBAL_IAM_RESOURCE_TYPES).issubset(exclusion)
+
+
+def test_global_iam_types_are_left_recorded_in_the_home_region(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
+
+    assert build_recorder_config(HOME_REGION)['exclusion'] == ['AWS::EC2::Volume']
+
+
+def test_global_iam_exclusions_are_not_duplicated(recorder_env):
+    """An operator who already excluded a global type must not get it twice."""
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::IAM::Role')
+
+    exclusion = build_recorder_config(OTHER_REGION)['exclusion']
+
+    assert exclusion.count('AWS::IAM::Role') == 1
+    assert len(exclusion) == len(mod.GLOBAL_IAM_RESOURCE_TYPES)
+
+
+def test_global_iam_types_are_not_excluded_when_nothing_else_is(recorder_env):
+    """
+    With an empty exclusion list the payload uses allSupported instead, where
+    includeGlobalResourceTypes does work. Injecting exclusions here would switch
+    strategies behind the operator's back.
+    """
+    recorder_env()
+
+    assert build_recorder_config(OTHER_REGION)['exclusion'] == []
+
+
+def test_global_iam_types_are_not_excluded_under_inclusion_strategy(recorder_env):
+    recorder_env(
+        CONFIG_RECORDER_STRATEGY='INCLUSION',
+        CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST='AWS::S3::Bucket',
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
+    )
+
+    assert build_recorder_config(OTHER_REGION)['exclusion'] == ['AWS::EC2::Volume']
 
 
 # --- build_recorder_payload --------------------------------------------------
 
-def test_delete_event_resets_to_all_supported(recorder_env):
+@pytest.mark.parametrize(
+    ('region', 'expect_global'),
+    [(HOME_REGION, True), (OTHER_REGION, False)],
+)
+def test_delete_event_resets_to_control_tower_defaults(recorder_env, region, expect_global):
     recorder_env()
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'Delete')
+        'rec', 'role-arn', build_recorder_config(region), 'Delete')
 
     assert payload['recordingGroup']['allSupported'] is True
-    assert payload['recordingGroup']['includeGlobalResourceTypes'] is True
+    assert payload['recordingGroup']['includeGlobalResourceTypes'] is expect_global
     assert 'recordingMode' not in payload
+
+
+@pytest.mark.parametrize(
+    ('region', 'expect_global'),
+    [(HOME_REGION, True), (OTHER_REGION, False)],
+)
+def test_empty_exclusion_list_records_everything(recorder_env, region, expect_global):
+    """
+    An empty exclusion list must not switch global IAM recording on outside the
+    home region. Doing so silently multiplies Config cost by the number of
+    governed regions while adding no coverage, because IAM is global.
+    """
+    recorder_env()
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(region), 'apply')
+
+    group = payload['recordingGroup']
+    assert group['allSupported'] is True
+    assert group['includeGlobalResourceTypes'] is expect_global
+    assert 'exclusionByResourceTypes' not in group
 
 
 def test_exclusion_payload_uses_exclusion_strategy(recorder_env):
     recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
 
     group = payload['recordingGroup']
     assert group['allSupported'] is False
@@ -239,13 +341,13 @@ def test_exclusion_payload_uses_exclusion_strategy(recorder_env):
     assert group['exclusionByResourceTypes']['resourceTypes'] == ['AWS::EC2::Volume']
 
 
-def test_empty_exclusion_list_records_everything(recorder_env):
-    recorder_env()
+def test_exclusion_payload_excludes_global_types_outside_home_region(recorder_env):
+    recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(OTHER_REGION), 'apply')
 
-    assert payload['recordingGroup']['allSupported'] is True
-    assert 'exclusionByResourceTypes' not in payload['recordingGroup']
+    excluded = payload['recordingGroup']['exclusionByResourceTypes']['resourceTypes']
+    assert set(mod.GLOBAL_IAM_RESOURCE_TYPES).issubset(excluded)
 
 
 def test_inclusion_payload_uses_inclusion_strategy(recorder_env):
@@ -254,29 +356,80 @@ def test_inclusion_payload_uses_inclusion_strategy(recorder_env):
         CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST='AWS::S3::Bucket',
     )
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
 
     group = payload['recordingGroup']
     assert group['resourceTypes'] == ['AWS::S3::Bucket']
     assert group['recordingStrategy']['useOnly'] == 'INCLUSION_BY_RESOURCE_TYPES'
 
 
-def test_daily_override_is_emitted_when_daily_types_present(recorder_env):
+def test_inclusion_strategy_with_no_resource_types_raises(recorder_env):
+    """
+    The alternative is a recorder with allSupported False and no resourceTypes,
+    which records nothing at all. Failing is better than silently switching Config
+    off across an organization.
+    """
+    recorder_env(CONFIG_RECORDER_STRATEGY='INCLUSION')
+
+    with pytest.raises(ValueError, match='records nothing'):
+        build_recorder_payload(
+            'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
+
+
+# --- recording mode ----------------------------------------------------------
+
+def test_override_is_emitted_when_override_types_present(recorder_env):
     recorder_env(
         CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
         CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::S3::Bucket',
     )
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
 
+    assert payload['recordingMode']['recordingFrequency'] == 'CONTINUOUS'
     override = payload['recordingMode']['recordingModeOverrides'][0]
     assert override['recordingFrequency'] == 'DAILY'
     assert override['resourceTypes'] == ['AWS::S3::Bucket']
 
 
-def test_no_recording_mode_when_no_daily_types(recorder_env):
+def test_default_frequency_is_applied_without_any_override_types(recorder_env):
+    """
+    DAILY with both override lists empty is the natural way to say "record
+    everything once every 24 hours". Emitting no recordingMode there left every
+    recorder on continuous recording with no error and no log line.
+    """
+    recorder_env(CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY='DAILY')
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
+
+    assert payload['recordingMode']['recordingFrequency'] == 'DAILY'
+    assert 'recordingModeOverrides' not in payload['recordingMode']
+
+
+def test_override_frequency_can_be_continuous_against_a_daily_default(recorder_env):
+    """
+    Firewall Manager needs continuous recording for the types its policies cover,
+    which requires exempting specific types from an otherwise daily default.
+    """
+    recorder_env(
+        CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY='DAILY',
+        CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY='CONTINUOUS',
+        CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST='AWS::EC2::VPC',
+    )
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
+
+    assert payload['recordingMode']['recordingFrequency'] == 'DAILY'
+    override = payload['recordingMode']['recordingModeOverrides'][0]
+    assert override['recordingFrequency'] == 'CONTINUOUS'
+    assert override['resourceTypes'] == ['AWS::EC2::VPC']
+    assert override['description'] == 'CONTINUOUS_OVERRIDE'
+
+
+def test_no_recording_mode_when_nothing_is_configured(recorder_env):
+    """A continuous default with no overrides is the AWS default, so send nothing."""
     recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
     payload = build_recorder_payload(
-        'rec', 'role-arn', build_recorder_config('us-east-1'), 'apply')
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'apply')
 
     assert 'recordingMode' not in payload

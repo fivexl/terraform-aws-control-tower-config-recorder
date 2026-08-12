@@ -22,6 +22,47 @@ locals {
 }
 
 # -----------------------------------------------------------------------------
+# Configuration guards
+#
+# These are preconditions rather than variable validation blocks because each one
+# reads two variables at once, and cross-variable validation needs Terraform 1.9.
+# This module supports 1.5, so the checks live on a resource instead.
+#
+# Both failures they catch are silent at runtime: one rewrites accounts nobody
+# meant to touch, the other writes a recorder that records nothing. Plan time is
+# the right place to find out.
+# -----------------------------------------------------------------------------
+
+resource "terraform_data" "validate_configuration" {
+  # Re-planned whenever a guarded value changes, so the checks cannot be skipped
+  # by an unrelated no-op plan.
+  triggers_replace = [
+    var.account_selection_mode,
+    var.config_recorder_strategy,
+    length(var.excluded_accounts),
+    length(var.included_accounts),
+    var.config_recorder_included_resource_types,
+  ]
+
+  lifecycle {
+    precondition {
+      condition     = var.account_selection_mode != "EXCLUSION" || length(var.excluded_accounts) > 0
+      error_message = "excluded_accounts must not be empty in EXCLUSION mode. Every managed account except the one this module runs in would have its Config Recorder rewritten, including Log Archive and Audit, which should keep their Control Tower defaults. List the accounts to leave alone, or use account_selection_mode = \"INCLUSION\" to name the accounts to change instead."
+    }
+
+    precondition {
+      condition     = var.account_selection_mode != "INCLUSION" || length(var.included_accounts) > 0
+      error_message = "included_accounts must not be empty in INCLUSION mode, otherwise the function runs and updates nothing."
+    }
+
+    precondition {
+      condition     = var.config_recorder_strategy != "INCLUSION" || trimspace(var.config_recorder_included_resource_types) != ""
+      error_message = "config_recorder_included_resource_types must not be empty with config_recorder_strategy = \"INCLUSION\". That combination produces a Config Recorder that records nothing, disabling Config recording across every targeted account."
+    }
+  }
+}
+
+# -----------------------------------------------------------------------------
 # Lambda Function (using terraform-aws-modules/lambda/aws)
 # -----------------------------------------------------------------------------
 
@@ -75,6 +116,7 @@ module "lambda" {
     CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST     = var.config_recorder_excluded_resource_types
     CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST     = var.config_recorder_included_resource_types
     CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY         = var.config_recorder_default_recording_frequency
+    CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY        = var.config_recorder_override_recording_frequency
     CONTROL_TOWER_HOME_REGION                           = local.control_tower_home_region
   }
 

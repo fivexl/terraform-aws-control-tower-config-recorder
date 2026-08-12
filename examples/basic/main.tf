@@ -6,18 +6,23 @@ provider "aws" {
 
 module "config_recorder_override" {
   source  = "fivexl/control-tower-config-recorder/aws"
-  version = "~> 3.0"
+  version = "~> 4.0"
 
   account_selection_mode = "EXCLUSION"
 
-  # Replace these with your real Management, Log Archive, and Audit account IDs.
-  # Anything not listed here has its Config Recorder rewritten.
-  excluded_accounts = ["111111111111", "222222222222", "333333333333"]
+  # Replace these with your real Log Archive and Audit account IDs. Anything not
+  # listed here has its Config Recorder rewritten, so an empty list is rejected at
+  # plan time. The management account is skipped automatically.
+  excluded_accounts = ["222222222222", "333333333333"]
 
-  config_recorder_strategy                    = "EXCLUSION"
-  config_recorder_excluded_resource_types     = "AWS::HealthLake::FHIRDatastore,AWS::Pinpoint::Segment,AWS::Pinpoint::ApplicationSettings"
-  config_recorder_default_recording_frequency = "CONTINUOUS"
-  config_recorder_daily_resource_types        = "AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"
+  config_recorder_strategy                     = "EXCLUSION"
+  config_recorder_excluded_resource_types      = "AWS::HealthLake::FHIRDatastore,AWS::Pinpoint::Segment,AWS::Pinpoint::ApplicationSettings"
+  config_recorder_default_recording_frequency  = "CONTINUOUS"
+  config_recorder_override_recording_frequency = "DAILY"
+  config_recorder_daily_resource_types         = "AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"
+
+  # Global IAM types are recorded in the Control Tower home region only, so this
+  # list is applied there and ignored in the other governed regions.
   config_recorder_daily_global_resource_types = "AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"
 
   tags = {

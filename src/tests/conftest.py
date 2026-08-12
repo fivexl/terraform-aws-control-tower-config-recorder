@@ -6,6 +6,12 @@ import pytest
 
 import ct_configrecorder_override as mod
 
+# Region behaviour is not symmetric: global resource types are recorded in the
+# Control Tower home region only. Tests that build settings or payloads should
+# exercise both, so both regions are named here rather than in each test.
+HOME_REGION = 'us-east-1'
+OTHER_REGION = 'eu-west-1'
+
 
 @pytest.fixture(autouse=True)
 def reset_identity_cache():
@@ -48,11 +54,12 @@ def recorder_env(monkeypatch):
         defaults = {
             'CONFIG_RECORDER_STRATEGY': 'EXCLUSION',
             'CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY': 'CONTINUOUS',
+            'CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY': 'DAILY',
             'CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST': '',
             'CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST': '',
             'CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST': '',
             'CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST': '',
-            'CONTROL_TOWER_HOME_REGION': 'us-east-1',
+            'CONTROL_TOWER_HOME_REGION': HOME_REGION,
         }
         defaults.update(overrides)
         for key, value in defaults.items():

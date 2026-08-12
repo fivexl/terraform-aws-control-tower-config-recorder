@@ -31,7 +31,7 @@ No providers.
 
 | Name | Source | Version |
 | ---- | ------ | ------- |
-| <a name="module_config_recorder_override"></a> [config\_recorder\_override](#module\_config\_recorder\_override) | fivexl/control-tower-config-recorder/aws | ~> 3.0 |
+| <a name="module_config_recorder_override"></a> [config\_recorder\_override](#module\_config\_recorder\_override) | fivexl/control-tower-config-recorder/aws | ~> 4.0 |
 
 ## Resources
 

@@ -28,15 +28,14 @@ variable "account_selection_mode" {
   }
 }
 
-# WARNING: The default below is a set of placeholder account IDs, not a safe
-# default. Those IDs match no real account, so leaving this unset in EXCLUSION
-# mode means the module rewrites the Config Recorder in EVERY managed account,
-# including Management, Log Archive, and Audit. Those three should normally keep
-# their Control Tower defaults. Always override this with your real account IDs.
+# There is no safe default here, because account IDs are specific to your
+# organization. The empty default therefore does not silently target everything:
+# EXCLUSION mode rejects an empty list at plan time (see the precondition in
+# main.tf), so the module cannot rewrite every managed account by accident.
 variable "excluded_accounts" {
-  description = "List of AWS account IDs to exclude. Should contain Management, Log Archive, and Audit accounts at minimum. Only used when account_selection_mode is EXCLUSION. The default is placeholder IDs and must be overridden - see the warning in the README."
+  description = "List of AWS account IDs to exclude. Should contain Log Archive and Audit accounts at minimum. Only used when account_selection_mode is EXCLUSION, where an empty list is rejected at plan time."
   type        = list(string)
-  default     = ["111111111111", "222222222222", "333333333333"]
+  default     = []
 }
 
 variable "included_accounts" {
@@ -72,20 +71,23 @@ variable "config_recorder_included_resource_types" {
   default     = "AWS::S3::Bucket,AWS::CloudTrail::Trail"
 }
 
+# NOTE: the two variables below keep "daily" in their names for compatibility.
+# They are the resource types that config_recorder_override_recording_frequency
+# applies to, which is DAILY by default but no longer has to be.
 variable "config_recorder_daily_resource_types" {
-  description = "Comma-separated list of resource types to record at daily cadence"
+  description = "Comma-separated list of resource types the override recording frequency applies to. AWS allows a single override, so this list and config_recorder_daily_global_resource_types share one frequency."
   type        = string
   default     = "AWS::AutoScaling::AutoScalingGroup,AWS::AutoScaling::LaunchConfiguration"
 }
 
 variable "config_recorder_daily_global_resource_types" {
-  description = "Comma-separated list of global resource types to record daily in the Control Tower home region"
+  description = "Comma-separated list of global resource types the override recording frequency applies to. Only applied in the Control Tower home region, since that is the only region where global types are recorded."
   type        = string
   default     = "AWS::IAM::Policy,AWS::IAM::User,AWS::IAM::Role,AWS::IAM::Group"
 }
 
 variable "config_recorder_default_recording_frequency" {
-  description = "Default frequency of recording configuration changes"
+  description = "Default frequency of recording configuration changes. Applies to every recorded resource type except those listed in the two override lists. AWS::Config::ResourceCompliance, AWS::Config::ConformancePackCompliance and AWS::Config::ConfigurationRecorder cannot be recorded daily and stay continuous regardless."
   type        = string
   default     = "CONTINUOUS"
 
@@ -95,12 +97,23 @@ variable "config_recorder_default_recording_frequency" {
   }
 }
 
+variable "config_recorder_override_recording_frequency" {
+  description = "Recording frequency applied to the resource types in config_recorder_daily_resource_types and config_recorder_daily_global_resource_types. Set this to CONTINUOUS with a DAILY default to keep specific types on continuous recording, which is what AWS Firewall Manager requires of the types its policies cover."
+  type        = string
+  default     = "DAILY"
+
+  validation {
+    condition     = contains(["CONTINUOUS", "DAILY"], var.config_recorder_override_recording_frequency)
+    error_message = "Must be CONTINUOUS or DAILY."
+  }
+}
+
 # -----------------------------------------------------------------------------
 # Lambda
 # -----------------------------------------------------------------------------
 
 variable "lambda_memory_size" {
-  description = "Memory in MB allocated to the Lambda function. Peak usage grows with the number of account-region pairs processed in one run."
+  description = "Memory in MB allocated to the Lambda function. The function holds one cached session per account and one settings dict per region, so memory is roughly flat in the number of accounts; this mainly buys CPU."
   type        = number
   default     = 1024
 }

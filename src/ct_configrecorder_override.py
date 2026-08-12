@@ -36,9 +36,13 @@ Environment Variables:
     CONFIG_RECORDER_STRATEGY: EXCLUSION or INCLUSION for resource types
     CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST: Comma-separated resource types to exclude
     CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST: Comma-separated resource types to include
-    CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST: Comma-separated resource types for daily recording
-    CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST: Global resource types for daily recording
+    CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST: Comma-separated resource types the
+        override frequency applies to
+    CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST: Global resource types the override
+        frequency applies to, in the home region only
     CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY: CONTINUOUS or DAILY
+    CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY: CONTINUOUS or DAILY, applied to the two
+        override resource type lists above
     CONTROL_TOWER_HOME_REGION: AWS region where Control Tower is deployed
     LOG_LEVEL: Logging level (default: INFO)
 """
@@ -65,6 +69,19 @@ class ConfigRecorderUpdateError(Exception):
 DEFAULT_RECORDER_NAME = 'aws-controltower-BaselineConfigRecorder'
 EXECUTION_ROLE_NAME = 'AWSControlTowerExecution'
 STACK_SET_NAME = 'AWSControlTowerBP-BASELINE-CONFIG'
+
+# The bundle of global resource types that includeGlobalResourceTypes covers.
+# They describe the same global resources in every region, so recording them
+# outside the Control Tower home region duplicates data at extra cost. Under the
+# EXCLUSION_BY_RESOURCE_TYPES strategy the includeGlobalResourceTypes flag is
+# ignored by AWS, so the only way to stop that duplication is to name these types
+# as exclusions. See build_recorder_config.
+GLOBAL_IAM_RESOURCE_TYPES = (
+    'AWS::IAM::User',
+    'AWS::IAM::Group',
+    'AWS::IAM::Role',
+    'AWS::IAM::Policy',
+)
 
 # Seconds to wait after an AssumeRole call to stay clear of STS request-rate limits.
 ASSUME_ROLE_THROTTLE_DELAY = 1
@@ -140,8 +157,9 @@ def build_recorder_config(aws_region):
     Parse Config Recorder settings from the environment once per invocation.
 
     Resource-type lists are normalised here so that per-account processing does
-    no further parsing. The home-region check is region-specific, so the daily
-    resource list is resolved per region rather than globally.
+    no further parsing. Two of the decisions depend on whether the target region
+    is the Control Tower home region, so the result is resolved per region rather
+    than once globally.
 
     Args:
         aws_region (str): The region the settings will be applied to
@@ -151,30 +169,47 @@ def build_recorder_config(aws_region):
     """
     strategy = os.getenv('CONFIG_RECORDER_STRATEGY', 'EXCLUSION')
     frequency = os.getenv('CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY', 'CONTINUOUS')
+    override_frequency = os.getenv('CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY', 'DAILY')
 
-    daily = _split_env_list('CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST')
-    daily_global = _split_env_list('CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST')
+    # The two environment variables still carry DAILY in their names for
+    # compatibility with earlier versions. They are simply the resource types
+    # that override_frequency applies to, which is no longer always daily.
+    override_types = _split_env_list('CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST')
+    override_global = _split_env_list('CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST')
     exclusion = _split_env_list('CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST')
     inclusion = _split_env_list('CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST')
 
     is_home_region = os.getenv('CONTROL_TOWER_HOME_REGION') == aws_region
 
-    if strategy == 'EXCLUSION':
-        # Recording an excluded type at daily cadence would be contradictory.
-        daily = [x for x in daily if x not in exclusion]
+    if strategy == 'EXCLUSION' and exclusion and not is_home_region:
+        # AWS ignores includeGlobalResourceTypes under EXCLUSION_BY_RESOURCE_TYPES
+        # and records the global IAM types anyway, so sending the flag as False is
+        # not enough to keep them out. Naming them as exclusions is, and outside
+        # the home region they are duplicate recordings of the same global
+        # resources. IAM churns on every deploy, so leaving them on multiplies
+        # Config cost by the number of governed regions for no added coverage.
+        exclusion = exclusion + [t for t in GLOBAL_IAM_RESOURCE_TYPES if t not in exclusion]
 
     if is_home_region:
-        daily = daily + daily_global
+        override_types = override_types + [
+            t for t in override_global if t not in override_types]
 
-    if strategy != 'EXCLUSION':
-        # Anything recorded daily must also be in the inclusion list, otherwise
-        # the override refers to a type that is not being recorded at all.
-        inclusion = inclusion + [x for x in daily if x not in inclusion]
+    if strategy == 'EXCLUSION':
+        # Overriding the cadence of a type that is not being recorded at all is
+        # contradictory. Filtered after the global list is appended, so types
+        # named in both the exclusion list and the global override list are
+        # dropped rather than slipping past the filter.
+        override_types = [x for x in override_types if x not in exclusion]
+    else:
+        # Anything given a cadence override must also be in the inclusion list,
+        # otherwise the override refers to a type that is not being recorded.
+        inclusion = inclusion + [x for x in override_types if x not in inclusion]
 
     return {
         'strategy': strategy,
         'frequency': frequency,
-        'daily': daily,
+        'override_frequency': override_frequency,
+        'override_types': override_types,
         'exclusion': exclusion,
         'inclusion': inclusion,
         'is_home_region': is_home_region,
@@ -193,6 +228,9 @@ def build_recorder_payload(recorder_name, role_arn_config, config, event_type):
 
     Returns:
         dict: ConfigurationRecorder payload
+
+    Raises:
+        ValueError: If the INCLUSION strategy is configured with no resource types
     """
     if event_type == 'Delete':
         return {
@@ -210,15 +248,22 @@ def build_recorder_payload(recorder_name, role_arn_config, config, event_type):
         if config['exclusion']:
             payload['recordingGroup'] = {
                 'allSupported': False,
+                # Sent for completeness only. AWS ignores this field under
+                # EXCLUSION_BY_RESOURCE_TYPES, which is why build_recorder_config
+                # adds the global IAM types to the exclusion list itself outside
+                # the home region.
                 'includeGlobalResourceTypes': False,
                 'exclusionByResourceTypes': {'resourceTypes': config['exclusion']},
                 'recordingStrategy': {'useOnly': 'EXCLUSION_BY_RESOURCE_TYPES'},
             }
         else:
-            # Nothing to exclude means record everything.
+            # Nothing to exclude means record every supported type. The global IAM
+            # types are recorded in the home region only, matching the Control
+            # Tower baseline: they describe the same global resources in every
+            # region, so recording them more than once adds cost without coverage.
             payload['recordingGroup'] = {
                 'allSupported': True,
-                'includeGlobalResourceTypes': True,
+                'includeGlobalResourceTypes': config['is_home_region'],
             }
     elif config['inclusion']:
         payload['recordingGroup'] = {
@@ -228,22 +273,34 @@ def build_recorder_payload(recorder_name, role_arn_config, config, event_type):
             'recordingStrategy': {'useOnly': 'INCLUSION_BY_RESOURCE_TYPES'},
         }
     else:
-        payload['recordingGroup'] = {
-            'allSupported': False,
-            'includeGlobalResourceTypes': False,
-        }
+        # allSupported False with no resourceTypes is a recorder that records
+        # nothing. Silently switching Config off across an organization is worse
+        # than failing, so refuse. Terraform also rejects this at plan time; this
+        # guard covers a function invoked with hand-edited environment variables.
+        raise ValueError(
+            'INCLUSION strategy requires at least one resource type. Set '
+            'config_recorder_included_resource_types, or switch to the EXCLUSION '
+            'strategy. Refusing to write a Config Recorder that records nothing.')
 
-    if config['daily']:
-        payload['recordingMode'] = {
-            'recordingFrequency': config['frequency'],
-            'recordingModeOverrides': [
+    # Emitted whenever a cadence is configured, not only when there are override
+    # types. A DAILY default with no overrides is the natural way to say "record
+    # everything once every 24 hours", and omitting the block there left every
+    # recorder on continuous recording with no error and no log line.
+    if config['override_types'] or config['frequency'] != 'CONTINUOUS':
+        payload['recordingMode'] = {'recordingFrequency': config['frequency']}
+
+        if config['override_types']:
+            override_frequency = config['override_frequency']
+            # AWS caps recordingModeOverrides at a single object, so one override
+            # frequency plus one resource type list is the whole of what the API
+            # can express here.
+            payload['recordingMode']['recordingModeOverrides'] = [
                 {
-                    'description': 'DAILY_OVERRIDE',
-                    'resourceTypes': config['daily'],
-                    'recordingFrequency': 'DAILY',
+                    'description': f'{override_frequency}_OVERRIDE',
+                    'resourceTypes': config['override_types'],
+                    'recordingFrequency': override_frequency,
                 }
-            ],
-        }
+            ]
 
     return payload
 
@@ -318,7 +375,7 @@ def update_config_recorder(session, account_id, aws_region, partition, config, e
 
     On 'Delete' events, resets the Config Recorder to Control Tower defaults
     (allSupported=True). Otherwise applies the configured recording strategy
-    with optional daily recording frequency overrides.
+    with optional per-resource-type recording frequency overrides.
 
     Args:
         session (boto3.Session): Session with credentials for the target account
