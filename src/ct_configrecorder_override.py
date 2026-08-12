@@ -46,11 +46,16 @@ Environment Variables:
     CONFIG_RECORDER_OVERRIDE_DAILY_RESOURCE_LIST: Comma-separated resource types the
         override frequency applies to
     CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST: Global resource types the override
-        frequency applies to, in the home region only
+        frequency applies to, in the global IAM recording region only
     CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY: CONTINUOUS or DAILY
     CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY: CONTINUOUS or DAILY, applied to the two
         override resource type lists above
-    CONTROL_TOWER_HOME_REGION: AWS region where Control Tower is deployed
+    GLOBAL_IAM_RECORDING_REGION: The single region that records the global IAM resource
+        types, normally the Control Tower home region. Empty means no region records them,
+        which is the only option when Control Tower is homed in a region where AWS cannot
+        record them.
+    CONTROL_TOWER_HOME_REGION: Where Control Tower is deployed. Used only to restore
+        Control Tower's own defaults on a Delete action.
     LOG_LEVEL: Logging level (default: INFO)
 """
 
@@ -78,11 +83,11 @@ EXECUTION_ROLE_NAME = 'AWSControlTowerExecution'
 STACK_SET_NAME = 'AWSControlTowerBP-BASELINE-CONFIG'
 
 # The bundle of global resource types that includeGlobalResourceTypes covers.
-# They describe the same global resources in every region, so recording them
-# outside the Control Tower home region duplicates data at extra cost. Under the
-# EXCLUSION_BY_RESOURCE_TYPES strategy the includeGlobalResourceTypes flag is
-# ignored by AWS, so the only way to stop that duplication is to name these types
-# as exclusions. See build_recorder_config.
+# They describe the same global resources in every region, so AWS recommends
+# recording them once, in one region, to avoid duplicate configuration items and
+# API throttling. Under the EXCLUSION_BY_RESOURCE_TYPES strategy the
+# includeGlobalResourceTypes flag is ignored by AWS, so the only way to stop that
+# duplication is to name these types as exclusions. See build_recorder_config.
 GLOBAL_IAM_RESOURCE_TYPES = (
     'AWS::IAM::User',
     'AWS::IAM::Group',
@@ -169,9 +174,9 @@ def build_recorder_config(aws_region):
     Parse Config Recorder settings from the environment once per invocation.
 
     Resource-type lists are normalised here so that per-account processing does
-    no further parsing. Two of the decisions depend on whether the target region
-    is the Control Tower home region, so the result is resolved per region rather
-    than once globally.
+    no further parsing. Two of the decisions depend on whether the target region is
+    the one nominated to record the global IAM types, so the result is resolved per
+    region rather than once globally.
 
     Args:
         aws_region (str): The region the settings will be applied to
@@ -182,6 +187,7 @@ def build_recorder_config(aws_region):
     strategy = os.getenv('CONFIG_RECORDER_STRATEGY', 'EXCLUSION')
     frequency = os.getenv('CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY', 'CONTINUOUS')
     override_frequency = os.getenv('CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY', 'DAILY')
+    global_iam_region = os.getenv('GLOBAL_IAM_RECORDING_REGION', '')
 
     # The two environment variables still carry DAILY in their names for
     # compatibility with earlier versions. They are simply the resource types
@@ -191,18 +197,26 @@ def build_recorder_config(aws_region):
     exclusion = _split_env_list('CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST')
     inclusion = _split_env_list('CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST')
 
-    is_home_region = os.getenv('CONTROL_TOWER_HOME_REGION') == aws_region
+    # The one region that records the global IAM types. Empty means no region
+    # records them, which is a legitimate choice when Control Tower is homed in a
+    # region where AWS cannot record them at all.
+    is_global_iam_region = bool(global_iam_region) and global_iam_region == aws_region
 
-    if strategy == 'EXCLUSION' and exclusion and not is_home_region:
+    # Tracked separately, and used only by the Delete branch. That branch restores
+    # Control Tower's own defaults, and Control Tower records global types in its
+    # home region, which is not necessarily where we chose to record them.
+    is_home_region = os.getenv('CONTROL_TOWER_HOME_REGION', '') == aws_region
+
+    if strategy == 'EXCLUSION' and exclusion and not is_global_iam_region:
         # AWS ignores includeGlobalResourceTypes under EXCLUSION_BY_RESOURCE_TYPES
         # and records the global IAM types anyway, so sending the flag as False is
         # not enough to keep them out. Naming them as exclusions is, and outside
-        # the home region they are duplicate recordings of the same global
+        # the nominated region they are duplicate recordings of the same global
         # resources. IAM churns on every deploy, so leaving them on multiplies
         # Config cost by the number of governed regions for no added coverage.
         exclusion = exclusion + [t for t in GLOBAL_IAM_RESOURCE_TYPES if t not in exclusion]
 
-    if is_home_region:
+    if is_global_iam_region:
         override_types = override_types + [
             t for t in override_global if t not in override_types]
 
@@ -224,6 +238,7 @@ def build_recorder_config(aws_region):
         'override_types': override_types,
         'exclusion': exclusion,
         'inclusion': inclusion,
+        'is_global_iam_region': is_global_iam_region,
         'is_home_region': is_home_region,
     }
 
@@ -245,6 +260,10 @@ def build_recorder_payload(recorder_name, role_arn_config, config, event_type):
         ValueError: If the INCLUSION strategy is configured with no resource types
     """
     if event_type == 'Delete':
+        # Restores Control Tower's defaults, so this follows the home region rather
+        # than global_iam_recording_region. Control Tower records global types where
+        # it lives, and the point of this branch is to hand the recorder back in the
+        # state Control Tower expects.
         return {
             'name': recorder_name,
             'roleARN': role_arn_config,
@@ -263,19 +282,19 @@ def build_recorder_payload(recorder_name, role_arn_config, config, event_type):
                 # Sent for completeness only. AWS ignores this field under
                 # EXCLUSION_BY_RESOURCE_TYPES, which is why build_recorder_config
                 # adds the global IAM types to the exclusion list itself outside
-                # the home region.
+                # the nominated region.
                 'includeGlobalResourceTypes': False,
                 'exclusionByResourceTypes': {'resourceTypes': config['exclusion']},
                 'recordingStrategy': {'useOnly': 'EXCLUSION_BY_RESOURCE_TYPES'},
             }
         else:
             # Nothing to exclude means record every supported type. The global IAM
-            # types are recorded in the home region only, matching the Control
-            # Tower baseline: they describe the same global resources in every
-            # region, so recording them more than once adds cost without coverage.
+            # types are recorded in one region only, matching the Control Tower
+            # baseline: they describe the same global resources in every region, so
+            # recording them more than once adds cost without coverage.
             payload['recordingGroup'] = {
                 'allSupported': True,
-                'includeGlobalResourceTypes': config['is_home_region'],
+                'includeGlobalResourceTypes': config['is_global_iam_region'],
             }
     elif config['inclusion']:
         payload['recordingGroup'] = {
@@ -315,6 +334,49 @@ def build_recorder_payload(recorder_name, role_arn_config, config, event_type):
             ]
 
     return payload
+
+
+def check_global_iam_region(global_iam_region, regions_seen, single_account_run):
+    """
+    Return an error message when the region nominated to record global IAM types
+    was never among the regions actually processed.
+
+    GLOBAL_IAM_RECORDING_REGION is otherwise an unchecked string comparison. A
+    typo, or a region Control Tower does not govern, means no region matches, so
+    the global IAM types are excluded everywhere and nothing records them. That is
+    silent: every account updates successfully and the run reports success while
+    IAM configuration recording has stopped organization-wide. Returning an error
+    here makes it reach the Lambda Errors metric and the alarm.
+
+    Args:
+        global_iam_region (str): Region nominated to record the global IAM types
+        regions_seen (set): Regions found in the StackSet during this run
+        single_account_run (bool): True when the run targeted one account
+
+    Returns:
+        str|None: Error message, or None when there is nothing to report
+    """
+    if not global_iam_region:
+        # Deliberately recording global IAM types nowhere.
+        return None
+
+    if not regions_seen or global_iam_region in regions_seen:
+        # Nothing was processed, so there is nothing to conclude; or it matched.
+        return None
+
+    if single_account_run:
+        # One account need not have an instance in every governed region, so this
+        # is only conclusive across a full walk.
+        logger.warning(
+            f'Global IAM recording region {global_iam_region} was not among the regions '
+            f'processed for this account: {sorted(regions_seen)}')
+        return None
+
+    return (
+        f'Global IAM recording region {global_iam_region} was not found among the regions '
+        f'Control Tower governs: {sorted(regions_seen)}. Nothing is recording the global '
+        f'IAM resource types as a result. Check global_iam_recording_region and '
+        f'control_tower_home_region.')
 
 
 def should_process_account(account_id, selection_mode, excluded_accounts, included_accounts):
@@ -454,9 +516,11 @@ def process_accounts(selection_mode, excluded_accounts, included_accounts, accou
         event_type (str): Passed through to update_config_recorder
 
     Returns:
-        dict: {'updated': int, 'failed': int, 'failures': list, 'fatal': str|None}
+        dict: {'updated': int, 'failed': int, 'failures': list, 'fatal': str|None,
+               'misconfigured': str|None}
     """
-    result = {'updated': 0, 'failed': 0, 'failures': [], 'fatal': None}
+    result = {
+        'updated': 0, 'failed': 0, 'failures': [], 'fatal': None, 'misconfigured': None}
 
     try:
         sts_client = boto3.client('sts')
@@ -470,6 +534,9 @@ def process_accounts(selection_mode, excluded_accounts, included_accounts, accou
         skipped_accounts = set()
         # Settings depend only on the region, so resolve each region once.
         config_cache = {}
+        # Every region the StackSet reported, used to confirm that the region
+        # nominated to record global IAM types is one Control Tower governs.
+        regions_seen = set()
 
         cloudformation = boto3.client('cloudformation')
         paginator = cloudformation.get_paginator('list_stack_instances')
@@ -482,6 +549,10 @@ def process_accounts(selection_mode, excluded_accounts, included_accounts, accou
             for item in page.get('Summaries', []):
                 account_id = item['Account']
                 region = item['Region']
+
+                # Recorded before any filtering, since this describes the regions
+                # Control Tower governs rather than the ones we chose to touch.
+                regions_seen.add(region)
 
                 if account_id in skipped_accounts:
                     continue
@@ -522,6 +593,9 @@ def process_accounts(selection_mode, excluded_accounts, included_accounts, accou
                     result['failed'] += 1
                     result['failures'].append(f'{account_id}/{region}: {e}')
                     # Continue processing other accounts and regions.
+
+        result['misconfigured'] = check_global_iam_region(
+            os.getenv('GLOBAL_IAM_RECORDING_REGION', ''), regions_seen, bool(account))
 
     except Exception as e:
         # A failure out here (bad StackSet name, missing permissions) means no
@@ -692,7 +766,8 @@ def summarise_run(result):
         dict: Summary payload when every targeted account was updated
 
     Raises:
-        ConfigRecorderUpdateError: If the run aborted, or any account failed
+        ConfigRecorderUpdateError: If the run aborted, any account failed, or the
+            configuration was found to be wrong
     """
     updated = result['updated']
     failed = result['failed']
@@ -701,11 +776,22 @@ def summarise_run(result):
         logger.error(f'Run aborted before completion: {result["fatal"]}')
         raise ConfigRecorderUpdateError(result['fatal'])
 
+    # A misconfiguration and per-account failures are independent, so report both
+    # rather than letting whichever is checked first hide the other.
+    problems = []
+
+    if result.get('misconfigured'):
+        logger.error(result['misconfigured'])
+        problems.append(result['misconfigured'])
+
     if failed:
         detail = '; '.join(result['failures'])
         logger.error(f'Updated {updated} account-region pairs, {failed} failed: {detail}')
-        raise ConfigRecorderUpdateError(
+        problems.append(
             f'{failed} of {updated + failed} account-region pairs failed: {detail}')
+
+    if problems:
+        raise ConfigRecorderUpdateError(' | '.join(problems))
 
     logger.info(f'Execution successful. Updated {updated} account-region pairs.')
     return {'statusCode': 200, 'updated': updated, 'failed': 0}

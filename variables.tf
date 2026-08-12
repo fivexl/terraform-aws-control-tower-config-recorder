@@ -8,9 +8,35 @@
 # Control Tower calls home, because that is what decides where global resource
 # types (IAM and friends) are recorded.
 variable "control_tower_home_region" {
-  description = "Region where Control Tower is deployed. Global resource types are only recorded in this region. Defaults to the region of the calling provider, which is correct when the module is applied in the Control Tower home region."
+  description = "Region where Control Tower is deployed. Global resource types are recorded only in this region unless global_iam_recording_region overrides that. Defaults to the region of the calling provider, which is correct when the module is applied in the Control Tower home region."
   type        = string
   default     = null
+
+  # Syntax only. It cannot tell us-east-2 from a mistyped us-east-1, which is why
+  # the Lambda also asserts that this region is one Control Tower actually governs.
+  validation {
+    condition     = var.control_tower_home_region == null || can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", var.control_tower_home_region))
+    error_message = "Must look like an AWS region, for example us-east-1 or eu-central-2."
+  }
+}
+
+# AWS records the global IAM resource types in whichever single region you
+# nominate, and Control Tower's baseline nominates its home region. That breaks
+# down when the home region is one of the ten where AWS cannot record them at all,
+# hence this override. See the plan-time check in main.tf.
+variable "global_iam_recording_region" {
+  description = "Region that records the global IAM resource types (IAM users, groups, roles, customer managed policies). Defaults to control_tower_home_region, which is correct almost always. Set it to another governed region when Control Tower is homed in one of the regions where AWS cannot record global IAM types, or to an empty string to accept that no region records them."
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.global_iam_recording_region == null ||
+      var.global_iam_recording_region == "" ||
+      can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", var.global_iam_recording_region))
+    )
+    error_message = "Must look like an AWS region, for example us-east-1, or \"\" to record global IAM types nowhere."
+  }
 }
 
 # -----------------------------------------------------------------------------

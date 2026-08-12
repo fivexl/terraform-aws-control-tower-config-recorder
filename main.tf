@@ -7,6 +7,33 @@ locals {
   # recorded. Falls back to the region this module is being applied in.
   control_tower_home_region = coalesce(var.control_tower_home_region, data.aws_region.current.region)
 
+  # The single region that records the global IAM types. Defaults to the home
+  # region, matching the Control Tower baseline. An empty string is a deliberate
+  # "nowhere", so this uses != null rather than coalesce.
+  global_iam_recording_region = (
+    var.global_iam_recording_region != null
+    ? var.global_iam_recording_region
+    : local.control_tower_home_region
+  )
+
+  # AWS can only record the global IAM resource types in regions where Config was
+  # available before February 2022. These ten came later, and Control Tower can be
+  # homed in some of them, so nominating one records nothing at all.
+  # https://docs.aws.amazon.com/config/latest/developerguide/select-resources.html
+  # Keep in step with that page as AWS adds regions.
+  regions_without_global_iam_recording = [
+    "ap-south-2",     # Asia Pacific (Hyderabad)
+    "ap-southeast-4", # Asia Pacific (Melbourne)
+    "ap-southeast-5", # Asia Pacific (Malaysia)
+    "ap-southeast-7", # Asia Pacific (Thailand)
+    "ca-west-1",      # Canada West (Calgary)
+    "eu-central-2",   # Europe (Zurich)
+    "eu-south-2",     # Europe (Spain)
+    "il-central-1",   # Israel (Tel Aviv)
+    "me-central-1",   # Middle East (UAE)
+    "mx-central-1",   # Mexico (Central)
+  ]
+
   # Account lists cross into the Lambda as JSON so the function can parse them
   # with json.loads rather than evaluating a Python literal.
   excluded_accounts_json = jsonencode(var.excluded_accounts)
@@ -61,6 +88,26 @@ resource "terraform_data" "validate_configuration" {
     precondition {
       condition     = var.config_recorder_strategy != "INCLUSION" || trimspace(var.config_recorder_included_resource_types) != ""
       error_message = "config_recorder_included_resource_types must not be empty with config_recorder_strategy = \"INCLUSION\". That combination produces a Config Recorder that records nothing, disabling Config recording across every targeted account."
+    }
+
+  }
+}
+
+# Kept separate from the checks above because the region it validates can come from
+# data.aws_region, and anything reading that resolves only once the provider is
+# configured. The variable-only checks stay independent of it so they always fail at
+# plan time.
+resource "terraform_data" "validate_global_iam_region" {
+  triggers_replace = [local.global_iam_recording_region]
+
+  lifecycle {
+    # Without this, a landing zone homed in one of those regions would exclude the
+    # global IAM types in every other governed region while requesting them in the
+    # one region AWS refuses to record them. Nothing would record them, and nothing
+    # would say so.
+    precondition {
+      condition     = !contains(local.regions_without_global_iam_recording, local.global_iam_recording_region)
+      error_message = "AWS cannot record the global IAM resource types in ${local.global_iam_recording_region}, because AWS Config was added there after February 2022. Set global_iam_recording_region to a governed region that supports them, or to \"\" to accept that no region records them."
     }
   }
 }
@@ -120,6 +167,7 @@ module "lambda" {
     CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST     = var.config_recorder_included_resource_types
     CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY         = var.config_recorder_default_recording_frequency
     CONFIG_RECORDER_OVERRIDE_RECORDING_FREQUENCY        = var.config_recorder_override_recording_frequency
+    GLOBAL_IAM_RECORDING_REGION                         = local.global_iam_recording_region
     CONTROL_TOWER_HOME_REGION                           = local.control_tower_home_region
   }
 

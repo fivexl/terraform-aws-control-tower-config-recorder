@@ -36,16 +36,38 @@ By design the module uses only EventBridge and Lambda. There is no queue in the 
 
 Resources are created in whichever region your provider targets, following Terraform Registry convention — the module takes no region for resource placement. Apply it in your Control Tower home region.
 
-`control_tower_home_region` is a separate concern: it tells the function which region records global resource types (IAM and similar). It defaults to the provider's region, which is correct for the normal case. Only set it explicitly if you are deliberately applying the module outside the Control Tower home region.
+`control_tower_home_region` is a separate concern: it tells the function where Control Tower lives, which by default is also the region that records global resource types. It defaults to the provider's region, which is correct for the normal case. Only set it explicitly if you are deliberately applying the module outside the Control Tower home region.
 
 ### Global resource types
 
-The global IAM types — IAM users, groups, roles and customer managed policies — describe the same resources in every region. Recording them in more than one region duplicates the data and the cost, and IAM churns on every deploy, so the duplication is not cheap. Control Tower's own baseline records them in the home region only, and this module matches that.
+The global IAM types — IAM users, groups, roles and customer managed policies — describe the same resources in every region. Recording them in more than one region duplicates the data and the cost, and IAM churns on every deploy, so the duplication is not cheap. [AWS recommends](https://docs.aws.amazon.com/config/latest/developerguide/select-resources.html) recording them once, in one supported region, to avoid duplicate configuration items and API throttling. Control Tower's own baseline records them in the home region only, and this module matches that.
 
 Two AWS behaviours make that harder than it looks, and the module handles both:
 
 - `includeGlobalResourceTypes` only works alongside `allSupported`. Under the `EXCLUSION_BY_RESOURCE_TYPES` strategy [AWS ignores the flag](https://docs.aws.amazon.com/config/latest/APIReference/API_RecordingGroup.html) and records the global IAM types anyway. The module therefore adds those four types to the exclusion list itself in every region except the home region. If your exclusion list is empty the module uses `allSupported` instead, where the flag does work.
 - `AWS::RDS::GlobalCluster` is recorded in every region where the recorder is enabled regardless of `includeGlobalResourceTypes`, because the flag covers only the four IAM types. Add it to `config_recorder_excluded_resource_types` if you do not want it recorded more than once.
+
+Because everything above hinges on one region name, two things guard it:
+
+- The Lambda checks that the nominated region is one the StackSet actually reported. A typo, or a region Control Tower does not govern, otherwise matches nothing, so every region excludes the global IAM types and none records them — while each account updates successfully and the run reports success. That check now fails the run, which puts it on the `Errors` metric and the alarm. It only applies to full walks, since a single account need not have an instance in every governed region.
+- Terraform rejects a nominated region where AWS cannot record global IAM types at all, at plan time.
+
+#### When Control Tower is homed where global IAM types cannot be recorded
+
+AWS can only record the global IAM types in regions where Config was available before February 2022. These ten came later, and Control Tower can be homed in some of them:
+
+`ap-south-2` (Hyderabad), `ap-southeast-4` (Melbourne), `ap-southeast-5` (Malaysia), `ap-southeast-7` (Thailand), `ca-west-1` (Calgary), `eu-central-2` (Zurich), `eu-south-2` (Spain), `il-central-1` (Tel Aviv), `me-central-1` (UAE), `mx-central-1` (Mexico Central).
+
+If your home region is one of these, the home region cannot be the one recording IAM. `global_iam_recording_region` nominates a different governed region instead, which is the only way to get any IAM coverage:
+
+```hcl
+control_tower_home_region   = "eu-central-2" # Zurich, cannot record global IAM types
+global_iam_recording_region = "eu-west-1"    # so record them here instead
+```
+
+Set it to `""` to accept that no region records the global IAM types. That is a valid choice, but make it deliberately — conformance packs that evaluate IAM resources will have nothing to evaluate.
+
+The variable defaults to `control_tower_home_region`, so leave it alone unless you are in this situation. Note that the `Delete` action still restores Control Tower's own defaults, which follow the home region rather than this setting.
 
 ### Recording frequency
 
@@ -240,6 +262,7 @@ Resource addresses also changed in 2.0.0 when the Lambda moved into `terraform-a
 | [aws_cloudwatch_metric_alarm.lambda_errors](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
 | [terraform_data.invoke_lambda](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
 | [terraform_data.validate_configuration](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
+| [terraform_data.validate_global_iam_region](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
 | [aws_iam_policy_document.lambda_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
 | [aws_partition.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/partition) | data source |
 | [aws_region.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/region) | data source |
@@ -258,11 +281,12 @@ Resource addresses also changed in 2.0.0 when the Lambda moved into `terraform-a
 | <a name="input_config_recorder_included_resource_types"></a> [config\_recorder\_included\_resource\_types](#input\_config\_recorder\_included\_resource\_types) | Comma-separated list of resource types to include in Config Recorder (used with INCLUSION strategy) | `string` | `"AWS::S3::Bucket,AWS::CloudTrail::Trail"` | no |
 | <a name="input_config_recorder_override_recording_frequency"></a> [config\_recorder\_override\_recording\_frequency](#input\_config\_recorder\_override\_recording\_frequency) | Recording frequency applied to the resource types in config\_recorder\_daily\_resource\_types and config\_recorder\_daily\_global\_resource\_types. Set this to CONTINUOUS with a DAILY default to keep specific types on continuous recording, which is what AWS Firewall Manager requires of the types its policies cover. | `string` | `"DAILY"` | no |
 | <a name="input_config_recorder_strategy"></a> [config\_recorder\_strategy](#input\_config\_recorder\_strategy) | Config Recorder strategy - EXCLUSION or INCLUSION | `string` | `"EXCLUSION"` | no |
-| <a name="input_control_tower_home_region"></a> [control\_tower\_home\_region](#input\_control\_tower\_home\_region) | Region where Control Tower is deployed. Global resource types are only recorded in this region. Defaults to the region of the calling provider, which is correct when the module is applied in the Control Tower home region. | `string` | `null` | no |
+| <a name="input_control_tower_home_region"></a> [control\_tower\_home\_region](#input\_control\_tower\_home\_region) | Region where Control Tower is deployed. Global resource types are recorded only in this region unless global\_iam\_recording\_region overrides that. Defaults to the region of the calling provider, which is correct when the module is applied in the Control Tower home region. | `string` | `null` | no |
 | <a name="input_create_error_alarm"></a> [create\_error\_alarm](#input\_create\_error\_alarm) | Create a CloudWatch alarm on the Lambda Errors metric. The function raises on any per-account failure, so this alarm fires when one or more accounts could not be updated. | `bool` | `true` | no |
 | <a name="input_eventbridge_maximum_event_age_in_seconds"></a> [eventbridge\_maximum\_event\_age\_in\_seconds](#input\_eventbridge\_maximum\_event\_age\_in\_seconds) | Maximum age of a Control Tower event EventBridge will still attempt to deliver (60-86400). | `number` | `3600` | no |
 | <a name="input_eventbridge_maximum_retry_attempts"></a> [eventbridge\_maximum\_retry\_attempts](#input\_eventbridge\_maximum\_retry\_attempts) | Number of times EventBridge retries delivering a Control Tower event to the Lambda before discarding it. | `number` | `10` | no |
 | <a name="input_excluded_accounts"></a> [excluded\_accounts](#input\_excluded\_accounts) | List of AWS account IDs to exclude. Should contain Log Archive and Audit accounts at minimum. Only used when account\_selection\_mode is EXCLUSION, where an empty list is rejected at plan time. | `list(string)` | `[]` | no |
+| <a name="input_global_iam_recording_region"></a> [global\_iam\_recording\_region](#input\_global\_iam\_recording\_region) | Region that records the global IAM resource types (IAM users, groups, roles, customer managed policies). Defaults to control\_tower\_home\_region, which is correct almost always. Set it to another governed region when Control Tower is homed in one of the regions where AWS cannot record global IAM types, or to an empty string to accept that no region records them. | `string` | `null` | no |
 | <a name="input_included_accounts"></a> [included\_accounts](#input\_included\_accounts) | List of AWS account IDs to include. Only used when account\_selection\_mode is INCLUSION. | `list(string)` | `[]` | no |
 | <a name="input_invoke_on_apply"></a> [invoke\_on\_apply](#input\_invoke\_on\_apply) | Invoke the Lambda on every terraform apply where the function code or configuration changed. Requires the AWS CLI on the machine running Terraform. Set to false to rely solely on Control Tower lifecycle events. | `bool` | `true` | no |
 | <a name="input_lambda_maximum_event_age_in_seconds"></a> [lambda\_maximum\_event\_age\_in\_seconds](#input\_lambda\_maximum\_event\_age\_in\_seconds) | Maximum age of an asynchronous invocation request Lambda will still process (60-21600). | `number` | `3600` | no |
@@ -276,9 +300,10 @@ Resource addresses also changed in 2.0.0 when the Lambda moved into `terraform-a
 
 | Name | Description |
 | ---- | ----------- |
-| <a name="output_control_tower_home_region"></a> [control\_tower\_home\_region](#output\_control\_tower\_home\_region) | Region treated as the Control Tower home region, where global resource types are recorded |
+| <a name="output_control_tower_home_region"></a> [control\_tower\_home\_region](#output\_control\_tower\_home\_region) | Region treated as the Control Tower home region |
 | <a name="output_error_alarm_arn"></a> [error\_alarm\_arn](#output\_error\_alarm\_arn) | ARN of the CloudWatch alarm on the Lambda Errors metric, or null when create\_error\_alarm is false |
 | <a name="output_eventbridge_rule_arn"></a> [eventbridge\_rule\_arn](#output\_eventbridge\_rule\_arn) | ARN of the EventBridge rule that triggers the Lambda on Control Tower lifecycle events |
+| <a name="output_global_iam_recording_region"></a> [global\_iam\_recording\_region](#output\_global\_iam\_recording\_region) | Region that records the global IAM resource types, or an empty string when no region records them |
 | <a name="output_lambda_function_arn"></a> [lambda\_function\_arn](#output\_lambda\_function\_arn) | ARN of the Config Recorder override Lambda function |
 | <a name="output_lambda_function_name"></a> [lambda\_function\_name](#output\_lambda\_function\_name) | Name of the Config Recorder override Lambda function |
 | <a name="output_lambda_role_arn"></a> [lambda\_role\_arn](#output\_lambda\_role\_arn) | ARN of the IAM role created for the Lambda function |

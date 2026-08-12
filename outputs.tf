@@ -29,6 +29,11 @@ output "error_alarm_arn" {
 }
 
 output "control_tower_home_region" {
-  description = "Region treated as the Control Tower home region, where global resource types are recorded"
+  description = "Region treated as the Control Tower home region"
   value       = local.control_tower_home_region
+}
+
+output "global_iam_recording_region" {
+  description = "Region that records the global IAM resource types, or an empty string when no region records them"
+  value       = local.global_iam_recording_region
 }

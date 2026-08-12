@@ -6,9 +6,10 @@ import pytest
 
 import ct_configrecorder_override as mod
 
-# Region behaviour is not symmetric: global resource types are recorded in the
-# Control Tower home region only. Tests that build settings or payloads should
-# exercise both, so both regions are named here rather than in each test.
+# Region behaviour is not symmetric: the global IAM resource types are recorded in
+# exactly one region, normally the Control Tower home region. Tests that build
+# settings or payloads should exercise both sides of that, so both regions are
+# named here rather than in each test.
 HOME_REGION = 'us-east-1'
 OTHER_REGION = 'eu-west-1'
 
@@ -59,6 +60,7 @@ def recorder_env(monkeypatch):
             'CONFIG_RECORDER_OVERRIDE_DAILY_GLOBAL_RESOURCE_LIST': '',
             'CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST': '',
             'CONFIG_RECORDER_OVERRIDE_INCLUDED_RESOURCE_LIST': '',
+            'GLOBAL_IAM_RECORDING_REGION': HOME_REGION,
             'CONTROL_TOWER_HOME_REGION': HOME_REGION,
         }
         defaults.update(overrides)

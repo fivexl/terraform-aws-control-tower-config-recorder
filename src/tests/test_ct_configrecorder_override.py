@@ -10,6 +10,7 @@ from ct_configrecorder_override import (
     ConfigRecorderUpdateError,
     build_recorder_config,
     build_recorder_payload,
+    check_global_iam_region,
     get_account_session,
     get_caller_identity,
     lifecycle_event_account,
@@ -248,7 +249,7 @@ def test_inclusion_strategy_adds_override_types_to_inclusion_list(recorder_env):
 #
 # includeGlobalResourceTypes is ignored under EXCLUSION_BY_RESOURCE_TYPES, so the
 # only way to stop the global IAM types being recorded in every governed region is
-# to name them as exclusions outside the home region.
+# to name them as exclusions outside the nominated region.
 
 def test_global_iam_types_are_excluded_outside_the_home_region(recorder_env):
     recorder_env(CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume')
@@ -296,6 +297,105 @@ def test_global_iam_types_are_not_excluded_under_inclusion_strategy(recorder_env
     assert build_recorder_config(OTHER_REGION)['exclusion'] == ['AWS::EC2::Volume']
 
 
+@pytest.mark.parametrize('region', [HOME_REGION, OTHER_REGION])
+def test_no_region_records_global_iam_types_when_the_region_is_empty(recorder_env, region):
+    """
+    An empty region is a deliberate "nowhere", which is the only option when
+    Control Tower is homed where AWS cannot record the global IAM types. No region
+    may then claim to be the one recording them.
+    """
+    recorder_env(
+        GLOBAL_IAM_RECORDING_REGION='',
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
+    )
+    config = build_recorder_config(region)
+
+    assert config['is_global_iam_region'] is False
+    assert set(mod.GLOBAL_IAM_RESOURCE_TYPES).issubset(config['exclusion'])
+
+
+@pytest.mark.parametrize('region', [HOME_REGION, OTHER_REGION])
+def test_empty_region_keeps_global_types_out_of_the_all_supported_payload(recorder_env, region):
+    recorder_env(GLOBAL_IAM_RECORDING_REGION='')
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(region), 'apply')
+
+    assert payload['recordingGroup']['includeGlobalResourceTypes'] is False
+
+
+def test_global_iam_region_can_differ_from_the_home_region(recorder_env):
+    """
+    Nominating another governed region is the only way to record global IAM types
+    when Control Tower is homed in one of the regions AWS excludes.
+    """
+    recorder_env(
+        GLOBAL_IAM_RECORDING_REGION=OTHER_REGION,
+        CONFIG_RECORDER_OVERRIDE_EXCLUDED_RESOURCE_LIST='AWS::EC2::Volume',
+    )
+
+    assert build_recorder_config(OTHER_REGION)['exclusion'] == ['AWS::EC2::Volume']
+    assert set(mod.GLOBAL_IAM_RESOURCE_TYPES).issubset(
+        build_recorder_config(HOME_REGION)['exclusion'])
+
+
+# --- global IAM region assertion ---------------------------------------------
+#
+# The region is otherwise an unchecked string comparison. A typo, or a region
+# Control Tower does not govern, matches nothing, so every region excludes the
+# global IAM types and nothing records them while the run reports success.
+
+def test_missing_global_iam_region_is_reported_on_a_full_walk():
+    error = check_global_iam_region('us-east-1', {'eu-west-1', 'eu-west-2'}, False)
+
+    assert error is not None
+    assert 'us-east-1' in error
+    assert 'eu-west-1' in error
+
+
+def test_matching_global_iam_region_reports_nothing():
+    assert check_global_iam_region('eu-west-1', {'eu-west-1', 'eu-west-2'}, False) is None
+
+
+def test_single_account_run_does_not_report_a_missing_region():
+    """One account need not have a StackSet instance in every governed region."""
+    assert check_global_iam_region('us-east-1', {'eu-west-1'}, True) is None
+
+
+def test_empty_global_iam_region_is_not_treated_as_a_mistake():
+    assert check_global_iam_region('', {'eu-west-1'}, False) is None
+
+
+def test_no_regions_processed_reports_nothing():
+    """Zero accounts matched, so the region list says nothing either way."""
+    assert check_global_iam_region('us-east-1', set(), False) is None
+
+
+def test_summarise_run_raises_on_a_misconfigured_global_iam_region():
+    with pytest.raises(ConfigRecorderUpdateError, match='global IAM'):
+        summarise_run({
+            'updated': 8,
+            'failed': 0,
+            'failures': [],
+            'fatal': None,
+            'misconfigured': 'Nothing is recording the global IAM resource types',
+        })
+
+
+def test_summarise_run_reports_misconfiguration_and_failures_together():
+    """Either one hiding the other would send someone chasing half the problem."""
+    with pytest.raises(ConfigRecorderUpdateError) as exc:
+        summarise_run({
+            'updated': 3,
+            'failed': 1,
+            'failures': ['111111111111/eu-west-1: boom'],
+            'fatal': None,
+            'misconfigured': 'global IAM region not governed',
+        })
+
+    assert 'global IAM region not governed' in str(exc.value)
+    assert '1 of 4' in str(exc.value)
+
+
 # --- build_recorder_payload --------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -330,6 +430,19 @@ def test_empty_exclusion_list_records_everything(recorder_env, region, expect_gl
     assert group['allSupported'] is True
     assert group['includeGlobalResourceTypes'] is expect_global
     assert 'exclusionByResourceTypes' not in group
+
+
+def test_delete_restores_control_tower_defaults_not_our_global_iam_choice(recorder_env):
+    """
+    Delete hands the recorder back in the state Control Tower expects, and Control
+    Tower records global types where it lives. Following our own choice of region
+    here would restore something Control Tower never configured.
+    """
+    recorder_env(GLOBAL_IAM_RECORDING_REGION='')
+    payload = build_recorder_payload(
+        'rec', 'role-arn', build_recorder_config(HOME_REGION), 'Delete')
+
+    assert payload['recordingGroup']['includeGlobalResourceTypes'] is True
 
 
 def test_exclusion_payload_uses_exclusion_strategy(recorder_env):
