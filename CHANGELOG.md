@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.1] - 2026-08-12
+
+### Changed
+- `pytest.ini` and `ruff.toml` are excluded from the deployed Lambda package. Dev tooling config, not needed at runtime, and previously shipped in the artifact alongside the handler.
+- `lambda_ignore_source_code_hash` variable, passed through to `terraform-aws-modules/lambda/aws`, defaulting to `true`. Suppresses a spurious plan/apply mismatch that can require a second `apply` on the first run in a fresh working directory, caused by the module computing `source_code_hash` from a packaged archive that does not exist yet at that point. Real code changes still deploy regardless of this setting: this module derives the archive's filename from the content of `src/` on every plan, and a changed filename is what the AWS provider actually redeploys on.
+
 ## [4.0.0] - 2026-08-12
 
 ### Fixed
@@ -31,8 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `config_recorder_daily_resource_types` and `config_recorder_daily_global_resource_types` keep their names for compatibility but are now documented as the resource types the override frequency applies to, which is daily only by default.
 - `lambda_memory_size` description no longer claims peak memory grows with the number of account-region pairs. The function holds one cached session per account and one settings dict per region, so memory is roughly flat; the setting mainly buys CPU.
 - The `Delete` action follows `control_tower_home_region` rather than `global_iam_recording_region`, since it restores Control Tower's own defaults and Control Tower records global types where it lives.
-- `pytest.ini` and `ruff.toml` are excluded from the deployed Lambda package. Dev tooling config, not needed at runtime, and previously shipped in the artifact alongside the handler.
-- `lambda_ignore_source_code_hash` variable, passed through to `terraform-aws-modules/lambda/aws`. Works around the first `apply` in a fresh working directory sometimes needing to run twice, because the module computes the function's source code hash from the packaged archive, which does not exist yet on that first run. Upstream module behavior, not specific to this module. Defaults to `false`, since setting it `true` also stops the function redeploying when only its source changes; documented in the README instead.
 - `pytest.ini` puts `tests` on `pythonpath` so shared test constants can be imported from `conftest`.
 
 ## [3.0.0] - 2026-07-22

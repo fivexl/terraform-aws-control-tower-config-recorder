@@ -139,9 +139,9 @@ variable "config_recorder_override_recording_frequency" {
 # -----------------------------------------------------------------------------
 
 variable "lambda_ignore_source_code_hash" {
-  description = "Passed straight through to terraform-aws-modules/lambda/aws. Set to true only as a workaround for the first apply in a fresh working directory needing to run twice, where the deployment archive does not exist yet when the module computes its source code hash. Leave false otherwise: true stops the function redeploying automatically when only its source changes."
+  description = "Passed straight through to terraform-aws-modules/lambda/aws. Suppresses a spurious plan/apply mismatch on the first apply in a fresh working directory, where the deployment archive does not exist yet when the module computes source_code_hash. Real code changes are still deployed: this module builds the archive filename from the content of src/, and that filename changing is what the AWS provider actually keys a redeploy on. Defaults to true, since there is no known downside to that in this module's configuration."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "lambda_memory_size" {
