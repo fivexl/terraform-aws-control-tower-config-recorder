@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.1] - 2026-08-12
+
+### Changed
+- `pytest.ini` and `ruff.toml` are excluded from the deployed Lambda package. Dev tooling config, not needed at runtime, and previously shipped in the artifact alongside the handler.
+- `lambda_ignore_source_code_hash` variable, passed through to `terraform-aws-modules/lambda/aws`, defaulting to `true`. Suppresses a spurious plan/apply mismatch that can require a second `apply` on the first run in a fresh working directory, caused by the module computing `source_code_hash` from a packaged archive that does not exist yet at that point. Real code changes still deploy regardless of this setting: this module derives the archive's filename from the content of `src/` on every plan, and a changed filename is what the AWS provider actually redeploys on.
+
 ## [4.0.0] - 2026-08-12
 
 ### Fixed

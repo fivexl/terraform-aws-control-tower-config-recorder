@@ -141,6 +141,13 @@ module "lambda" {
         "!tests/.*",
         "!requirements\\.txt",
         "!__pycache__/.*",
+        # Dev tooling config, meaningful only to pytest/ruff on a workstation or in
+        # CI. Neither is imported by the handler, so leaving them out shrinks the
+        # deployed artifact without changing behavior.
+        "!pytest\\.ini",
+        "!ruff\\.toml",
+        "!\\.pytest_cache/.*",
+        "!\\.ruff_cache/.*",
       ]
     }
   ]
@@ -154,6 +161,15 @@ module "lambda" {
   create_async_event_config    = true
   maximum_retry_attempts       = var.lambda_maximum_retry_attempts
   maximum_event_age_in_seconds = var.lambda_maximum_event_age_in_seconds
+
+  # terraform-aws-modules/lambda/aws computes source_code_hash from fileexists() on
+  # the packaged archive. On the very first apply in a fresh working directory that
+  # archive does not exist yet when the hash is computed, which can make plan and
+  # apply disagree and require running apply twice. ignore_source_code_hash works
+  # around it by skipping that hash entirely, which also means the function stops
+  # redeploying automatically when only the source changes. Off by default for that
+  # reason; see the README note on the first-apply case.
+  ignore_source_code_hash = var.lambda_ignore_source_code_hash
 
   environment_variables = {
     ACCOUNT_SELECTION_MODE                              = var.account_selection_mode
