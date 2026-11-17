@@ -144,6 +144,12 @@ variable "lambda_ignore_source_code_hash" {
   default     = true
 }
 
+variable "lambda_trigger_on_package_timestamp" {
+  description = "Passed straight through to terraform-aws-modules/lambda/aws. When true (the upstream default), every plan rebuilds the deployment archive, because its build trigger includes a timestamp that changes on every run. In a fresh working directory, such as every CI run, that shows the Lambda as changed even when src/ is not. Set to false to rebuild only when the archive filename, which this module derives from the content of src/, changes."
+  type        = bool
+  default     = true
+}
+
 variable "lambda_memory_size" {
   description = "Memory in MB allocated to the Lambda function. The function holds one cached session per account and one settings dict per region, so memory is roughly flat in the number of accounts; this mainly buys CPU."
   type        = number

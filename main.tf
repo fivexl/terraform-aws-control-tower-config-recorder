@@ -171,6 +171,11 @@ module "lambda" {
   # reason; see the README note on the first-apply case.
   ignore_source_code_hash = var.lambda_ignore_source_code_hash
 
+  # Without this, a plan in a fresh working directory (every CI run) rebuilds the
+  # archive and, with invoke_on_apply, invokes the function, even when src/ is
+  # unchanged. Upstream default kept; see the variable.
+  trigger_on_package_timestamp = var.lambda_trigger_on_package_timestamp
+
   environment_variables = {
     ACCOUNT_SELECTION_MODE                              = var.account_selection_mode
     EXCLUDED_ACCOUNTS                                   = local.excluded_accounts_json
