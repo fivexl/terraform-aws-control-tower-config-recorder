@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `lambda_trigger_on_package_timestamp` variable, passed through to `terraform-aws-modules/lambda/aws` as `trigger_on_package_timestamp`, defaulting to `true` (the upstream default, so nothing changes unless it is set). Upstream adds a timestamp to the archive's build trigger, so every plan in a fresh working directory, such as each CI run, rebuilds the archive and updates the function even when `src/` is unchanged, and with `invoke_on_apply` the apply also invokes the function. `false` rebuilds only when the content-derived archive filename changes.
+
 ## [4.0.1] - 2026-08-12
 
 ### Changed
